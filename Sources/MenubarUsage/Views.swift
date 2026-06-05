@@ -249,13 +249,14 @@ final class StatusDotView: NSView {
 // MARK: - Menu bar gauge
 
 /// Renders the always-visible menu bar content: for each provider a single-letter
-/// badge plus two slim vertical gauge bars (5-hour and weekly), color-graded by
+/// badge plus two slim horizontal gauge bars (5-hour and weekly), color-graded by
 /// consumption. Produces an `NSImage` sized to the menu bar so it can be set as
 /// the status item's button image (clicks + positioning come for free).
 enum MenuBarGauge {
     private static var badgeFont: NSFont { NSFont.systemFont(ofSize: 9, weight: .bold) }
-    private static let barWidth: CGFloat = 3
-    private static let barGap: CGFloat = 2
+    private static let barWidth: CGFloat = 20
+    private static let barHeight: CGFloat = 4
+    private static let barGap: CGFloat = 3
     private static let badgeGap: CGFloat = 3
     private static let providerGap: CGFloat = 9
     private static let sidePadding: CGFloat = 3
@@ -263,7 +264,7 @@ enum MenuBarGauge {
     /// Width one provider's cell occupies (badge + two bars).
     private static func cellWidth(badge: String) -> CGFloat {
         let badgeWidth = (badge as NSString).size(withAttributes: [.font: badgeFont]).width
-        return badgeWidth + badgeGap + barWidth * 2 + barGap
+        return badgeWidth + badgeGap + barWidth
     }
 
     @MainActor
@@ -311,31 +312,30 @@ enum MenuBarGauge {
         badge.draw(at: NSPoint(x: x, y: (height - badgeSize.height) / 2), withAttributes: badgeAttrs)
         x += badgeSize.width + badgeGap
 
-        // Two vertical gauges: 5-hour (left), weekly (right).
-        let barTop: CGFloat = height - 4
-        let barBottom: CGFloat = 3
-        let barHeight = barTop - barBottom
+        // Two stacked gauges: 5-hour on top, weekly below. Low values are much
+        // easier to distinguish this way than in a 3-point vertical capsule.
+        let stackHeight = barHeight * 2 + barGap
+        let bottom = (height - stackHeight) / 2
         drawBar(percent: snapshot.dailyPercent, connected: snapshot.isConnected,
-                x: x, bottom: barBottom, fullHeight: barHeight)
-        x += barWidth + barGap
+                x: x, y: bottom + barHeight + barGap)
         drawBar(percent: snapshot.weeklyPercent, connected: snapshot.isConnected,
-                x: x, bottom: barBottom, fullHeight: barHeight)
+                x: x, y: bottom)
         x += barWidth
 
         return x
     }
 
     private static func drawBar(percent: Double?, connected: Bool,
-                                x: CGFloat, bottom: CGFloat, fullHeight: CGFloat) {
-        let radius = barWidth / 2
-        let track = NSRect(x: x, y: bottom, width: barWidth, height: fullHeight)
+                                x: CGFloat, y: CGFloat) {
+        let radius = barHeight / 2
+        let track = NSRect(x: x, y: y, width: barWidth, height: barHeight)
         NSColor.quaternaryLabelColor.setFill()
         NSBezierPath(roundedRect: track, xRadius: radius, yRadius: radius).fill()
 
         guard connected, let percent else { return }
         let clamped = max(0, min(100, percent))
-        let fillHeight = max(barWidth, fullHeight * CGFloat(clamped / 100))
-        let fill = NSRect(x: x, y: bottom, width: barWidth, height: fillHeight)
+        let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
+        let fill = NSRect(x: x, y: y, width: fillWidth, height: barHeight)
         UsageFormat.color(forPercent: clamped).setFill()
         NSBezierPath(roundedRect: fill, xRadius: radius, yRadius: radius).fill()
     }
