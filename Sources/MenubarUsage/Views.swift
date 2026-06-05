@@ -23,16 +23,16 @@ final class ProviderLogoView: NSView {
         super.draw(dirtyRect)
 
         let bounds = self.bounds.insetBy(dx: 2, dy: 2)
-        let fill: NSColor
-        let stroke: NSColor
-        switch provider {
-        case .codex:
-            fill = selected ? NSColor(calibratedRed: 0.06, green: 0.40, blue: 0.33, alpha: 1) : NSColor(calibratedRed: 0.12, green: 0.32, blue: 0.28, alpha: 1)
-            stroke = NSColor(calibratedRed: 0.45, green: 0.85, blue: 0.74, alpha: 1)
-        case .claude:
-            fill = selected ? NSColor(calibratedRed: 0.63, green: 0.35, blue: 0.20, alpha: 1) : NSColor(calibratedRed: 0.45, green: 0.33, blue: 0.25, alpha: 1)
-            stroke = NSColor(calibratedRed: 0.86, green: 0.73, blue: 0.58, alpha: 1)
+
+        if provider == .codex {
+            drawOpenAIBadge(in: bounds)
+            return
         }
+
+        let fill = selected
+            ? NSColor(calibratedRed: 0.63, green: 0.35, blue: 0.20, alpha: 1)
+            : NSColor(calibratedRed: 0.45, green: 0.33, blue: 0.25, alpha: 1)
+        let stroke = NSColor(calibratedRed: 0.86, green: 0.73, blue: 0.58, alpha: 1)
 
         fill.setFill()
         stroke.setStroke()
@@ -40,11 +40,6 @@ final class ProviderLogoView: NSView {
         path.lineWidth = selected ? 2 : 1
         path.fill()
         path.stroke()
-
-        if provider == .codex {
-            drawChatGPTMark(in: bounds)
-            return
-        }
 
         let text = provider.fallbackBadge
         let attributes: [NSAttributedString.Key: Any] = [
@@ -58,41 +53,67 @@ final class ProviderLogoView: NSView {
         )
     }
 
-    private func drawChatGPTMark(in bounds: NSRect) {
+    private func drawOpenAIBadge(in bounds: NSRect) {
         NSGraphicsContext.current?.saveGraphicsState()
-        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6).addClip()
+
+        let badge = NSBezierPath(ovalIn: bounds)
+        NSColor.white.setFill()
+        badge.fill()
+        NSColor(calibratedWhite: 0.70, alpha: 1).setStroke()
+        badge.lineWidth = 1
+        badge.stroke()
 
         let center = NSPoint(x: bounds.midX, y: bounds.midY)
-        let markSize = min(bounds.width, bounds.height) * 0.68
-        let radius = markSize * 0.29
-        let lobeSize = NSSize(width: markSize * 0.46, height: markSize * 0.18)
-        let lobeRect = NSRect(
-            x: center.x - lobeSize.width / 2,
-            y: center.y + radius - lobeSize.height / 2,
-            width: lobeSize.width,
-            height: lobeSize.height
-        )
+        let scale = min(bounds.width, bounds.height) / 28
+        let outerRadius = 7.0 * scale
+        let innerRadius = 3.9 * scale
+        let lobeLength = 5.9 * scale
+        let lineWidth = 2.1 * scale
+        let ink = NSColor(calibratedWhite: 0.15, alpha: 1)
 
-        NSColor.white.setFill()
+        ink.setStroke()
         for index in 0..<6 {
-            let transform = NSAffineTransform()
-            transform.translateX(by: center.x, yBy: center.y)
-            transform.rotate(byDegrees: CGFloat(index) * 60)
-            transform.translateX(by: -center.x, yBy: -center.y)
+            let angle = CGFloat(index) * .pi / 3 - .pi / 2
+            let lobeCenter = NSPoint(
+                x: center.x + cos(angle) * outerRadius,
+                y: center.y + sin(angle) * outerRadius
+            )
+            let tangent = angle + .pi / 2
 
-            let petal = NSBezierPath(roundedRect: lobeRect, xRadius: lobeSize.height / 2, yRadius: lobeSize.height / 2)
-            petal.transform(using: transform as AffineTransform)
-            petal.fill()
+            let path = NSBezierPath()
+            path.lineWidth = lineWidth
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+
+            let start = NSPoint(
+                x: lobeCenter.x - cos(tangent) * lobeLength / 2,
+                y: lobeCenter.y - sin(tangent) * lobeLength / 2
+            )
+            let end = NSPoint(
+                x: lobeCenter.x + cos(tangent) * lobeLength / 2,
+                y: lobeCenter.y + sin(tangent) * lobeLength / 2
+            )
+            let pull = NSPoint(
+                x: center.x + cos(angle) * innerRadius,
+                y: center.y + sin(angle) * innerRadius
+            )
+
+            path.move(to: start)
+            path.curve(
+                to: end,
+                controlPoint1: NSPoint(x: start.x * 0.63 + pull.x * 0.37, y: start.y * 0.63 + pull.y * 0.37),
+                controlPoint2: NSPoint(x: end.x * 0.63 + pull.x * 0.37, y: end.y * 0.63 + pull.y * 0.37)
+            )
+            path.stroke()
         }
 
-        let cutout = NSRect(
-            x: center.x - markSize * 0.17,
-            y: center.y - markSize * 0.17,
-            width: markSize * 0.34,
-            height: markSize * 0.34
-        )
-        NSColor(calibratedRed: 0.12, green: 0.32, blue: 0.28, alpha: 1).setFill()
-        NSBezierPath(ovalIn: cutout).fill()
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: NSRect(
+            x: center.x - 2.3 * scale,
+            y: center.y - 2.3 * scale,
+            width: 4.6 * scale,
+            height: 4.6 * scale
+        )).fill()
 
         NSGraphicsContext.current?.restoreGraphicsState()
     }
