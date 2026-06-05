@@ -1,6 +1,6 @@
 import AppKit
 
-/// Fallback rounded-badge glyph (`CL` / `GP`) drawn when the provider's desktop
+/// Fallback rounded-badge glyph drawn when the provider's desktop
 /// app icon isn't installed.
 final class ProviderLogoView: NSView {
     private let provider: Provider
@@ -41,7 +41,12 @@ final class ProviderLogoView: NSView {
         path.fill()
         path.stroke()
 
-        let text = provider.badge
+        if provider == .codex {
+            drawChatGPTMark(in: bounds)
+            return
+        }
+
+        let text = provider.fallbackBadge
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.boldSystemFont(ofSize: 10),
             .foregroundColor: NSColor.white
@@ -51,6 +56,45 @@ final class ProviderLogoView: NSView {
             at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
             withAttributes: attributes
         )
+    }
+
+    private func drawChatGPTMark(in bounds: NSRect) {
+        NSGraphicsContext.current?.saveGraphicsState()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6).addClip()
+
+        let center = NSPoint(x: bounds.midX, y: bounds.midY)
+        let markSize = min(bounds.width, bounds.height) * 0.68
+        let radius = markSize * 0.29
+        let lobeSize = NSSize(width: markSize * 0.46, height: markSize * 0.18)
+        let lobeRect = NSRect(
+            x: center.x - lobeSize.width / 2,
+            y: center.y + radius - lobeSize.height / 2,
+            width: lobeSize.width,
+            height: lobeSize.height
+        )
+
+        NSColor.white.setFill()
+        for index in 0..<6 {
+            let transform = NSAffineTransform()
+            transform.translateX(by: center.x, yBy: center.y)
+            transform.rotate(byDegrees: CGFloat(index) * 60)
+            transform.translateX(by: -center.x, yBy: -center.y)
+
+            let petal = NSBezierPath(roundedRect: lobeRect, xRadius: lobeSize.height / 2, yRadius: lobeSize.height / 2)
+            petal.transform(using: transform as AffineTransform)
+            petal.fill()
+        }
+
+        let cutout = NSRect(
+            x: center.x - markSize * 0.17,
+            y: center.y - markSize * 0.17,
+            width: markSize * 0.34,
+            height: markSize * 0.34
+        )
+        NSColor(calibratedRed: 0.12, green: 0.32, blue: 0.28, alpha: 1).setFill()
+        NSBezierPath(ovalIn: cutout).fill()
+
+        NSGraphicsContext.current?.restoreGraphicsState()
     }
 }
 
@@ -183,7 +227,7 @@ final class StatusDotView: NSView {
 
 // MARK: - Menu bar gauge
 
-/// Renders the always-visible menu bar content: for each provider a 2-letter
+/// Renders the always-visible menu bar content: for each provider a single-letter
 /// badge plus two slim vertical gauge bars (5-hour and weekly), color-graded by
 /// consumption. Produces an `NSImage` sized to the menu bar so it can be set as
 /// the status item's button image (clicks + positioning come for free).
@@ -213,7 +257,7 @@ enum MenuBarGauge {
 
         var width = sidePadding * 2
         for (i, snap) in cells.enumerated() {
-            width += cellWidth(badge: snap.provider.badge)
+            width += cellWidth(badge: snap.provider.menuBarBadge)
             if i < cells.count - 1 { width += providerGap }
         }
 
@@ -233,8 +277,8 @@ enum MenuBarGauge {
     private static func drawCell(_ snapshot: UsageSnapshot, atX startX: CGFloat, height: CGFloat) -> CGFloat {
         var x = startX
 
-        // Two-letter provider badge in its accent color (dimmed if disconnected).
-        let badge = snapshot.provider.badge as NSString
+        // Single-letter provider badge in its accent color (dimmed if disconnected).
+        let badge = snapshot.provider.menuBarBadge as NSString
         let badgeColor = snapshot.isConnected
             ? snapshot.provider.accentColor
             : NSColor.tertiaryLabelColor

@@ -72,11 +72,19 @@ enum Provider: String, CaseIterable, Sendable {
 
     var symbol: String { rawValue }
 
-    /// Two-letter badge used by the fallback logo glyph.
-    var badge: String {
+    /// Single-letter badge used in the compact menu bar gauge.
+    var menuBarBadge: String {
         switch self {
-        case .claude: "CL"
-        case .codex: "GP"
+        case .claude: "C"
+        case .codex: "G"
+        }
+    }
+
+    /// Text badge used only when a provider has no app icon or custom mark.
+    var fallbackBadge: String {
+        switch self {
+        case .claude: "C"
+        case .codex: "G"
         }
     }
 

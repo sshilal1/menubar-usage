@@ -11,7 +11,7 @@ that project; the menu bar UI is new.
 
 ## What it shows
 
-In the menu bar, each provider gets a 2‑letter badge (`CL`, `GP`) and two slim
+In the menu bar, each provider gets a one-letter badge (`C`, `G`) and two slim
 gauge bars — the left bar is the **5‑hour** window, the right is the **weekly**
 window — color‑graded green → orange → red as you approach the limit.
 
