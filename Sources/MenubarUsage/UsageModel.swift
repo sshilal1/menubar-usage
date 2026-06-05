@@ -107,8 +107,9 @@ enum UsageFormat {
     /// Color graded by how much of a limit is consumed.
     static func color(forPercent percent: Double) -> NSColor {
         switch percent {
-        case ..<60: NSColor.systemGreen
-        case ..<85: NSColor.systemOrange
+        case ..<40: NSColor.systemGreen
+        case ..<60: NSColor.systemYellow
+        case ..<90: NSColor.systemOrange
         default: NSColor.systemRed
         }
     }
