@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 // MARK: - Codex / ChatGPT collector
 //
@@ -323,22 +324,79 @@ enum ClaudeCredentials {
         lock.unlock()
 
         if shouldStartRead {
+            DebugLog.write("claude-cred: starting background keychain read for 'Claude Code-credentials'")
             DispatchQueue.global(qos: .userInitiated).async {
-                let result = readFromKeychain() // may show a one-time prompt
+                let (result, status) = readFromKeychain() // may show a one-time prompt
                 lock.lock()
                 if let result {
                     cached = result
                     keychainRetryAfter = nil
+                    DebugLog.write("claude-cred: keychain read OK — token acquired"
+                        + " (expires \(result.expiryDate.map { timestamp($0) } ?? "?"))")
                 } else {
                     // Denied / unavailable: back off before prompting again.
                     keychainRetryAfter = Date().addingTimeInterval(keychainCooldown)
+                    DebugLog.write("claude-cred: keychain read FAILED — \(keychainErrorText(status));"
+                        + " backing off \(Int(keychainCooldown))s before retry."
+                        + " The Claude gauge will show the local estimate until this succeeds.")
                 }
                 keychainReading = false
                 lock.unlock()
             }
+        } else if current == nil {
+            DebugLog.write("claude-cred: no token yet"
+                + (cooling ? " (in keychain back-off window)" : " (keychain read already in flight)"))
         }
 
         return current
+    }
+
+    /// Synchronous keychain read for the `--once` CLI diagnostic only. Blocks (and
+    /// may show the authorization prompt) so the one-shot path can actually exercise
+    /// the live API on machines where the token lives *only* in the Keychain — there
+    /// `currentNonBlocking()` always returns nil on first call, so without this the
+    /// `--once` readout could never show live Claude data and was misleading.
+    ///
+    /// Never call this from the GUI: a synchronous keychain prompt would freeze the
+    /// refresh (see `currentNonBlocking()`'s doc comment).
+    static func prewarmBlocking() {
+        lock.lock()
+        if let cached, let expiry = cached.expiryDate, expiry.timeIntervalSinceNow > 120 {
+            lock.unlock()
+            return
+        }
+        if let fromFile = readFromFile() {
+            cached = fromFile
+            lock.unlock()
+            DebugLog.write("claude-cred: [--once] token loaded from credentials file")
+            return
+        }
+        lock.unlock()
+
+        DebugLog.write("claude-cred: [--once] blocking keychain read (may prompt)…")
+        let (result, status) = readFromKeychain()
+        lock.lock()
+        if let result {
+            cached = result
+            DebugLog.write("claude-cred: [--once] keychain read OK — token acquired")
+        } else {
+            DebugLog.write("claude-cred: [--once] keychain read FAILED — \(keychainErrorText(status))")
+        }
+        lock.unlock()
+    }
+
+    /// Human-readable `(message + numeric code)` for a Keychain `OSStatus`, e.g.
+    /// `-25308` → "Interaction is not allowed with the Security Server." Common ones:
+    /// `-25300` item not found, `-25293` auth failed, `-25308` interaction not allowed
+    /// (the LaunchAgent can't show a prompt), `-128` user cancelled the prompt.
+    private static func keychainErrorText(_ status: OSStatus) -> String {
+        let message = SecCopyErrorMessageString(status, nil) as String? ?? "unknown error"
+        return "\(message) (OSStatus \(status))"
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        let f = ISO8601DateFormatter()
+        return f.string(from: date)
     }
 
     private struct Wrapper: Decodable { let claudeAiOauth: OAuth }
@@ -357,7 +415,9 @@ enum ClaudeCredentials {
         return nil
     }
 
-    private static func readFromKeychain() -> OAuth? {
+    /// Reads the token from the Keychain, returning both the decoded OAuth (if any)
+    /// and the raw `OSStatus` so callers can log *why* a read failed.
+    private static func readFromKeychain() -> (oauth: OAuth?, status: OSStatus) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -365,11 +425,11 @@ enum ClaudeCredentials {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else {
-            return nil
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data else {
+            return (nil, status)
         }
-        return try? JSONDecoder().decode(Wrapper.self, from: data).claudeAiOauth
+        return (try? JSONDecoder().decode(Wrapper.self, from: data).claudeAiOauth, status)
     }
 }
 
@@ -421,30 +481,93 @@ struct ClaudeUsageCollector: UsageCollecting {
         liveCacheAt = Date()
     }
 
+    // Back-off after a *failed* live fetch. Without this, the `liveMinInterval`
+    // throttle (which only applies after a success) doesn't kick in, so a 429 made
+    // the app re-hit the rate-limited endpoint on every 20s tick — perpetuating the
+    // throttle. After a failure we wait at least `liveFailureBackoff` (or the
+    // server's `Retry-After`, capped) before trying again. Shares `liveCacheLock`.
+    private nonisolated(unsafe) static var liveRetryAfter: Date?
+    private static let liveFailureBackoff: TimeInterval = 90
+    private static let maxFailureBackoff: TimeInterval = 10 * 60
+
+    private static func inFailureBackoff() -> Date? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        if let until = liveRetryAfter, until > Date() { return until }
+        return nil
+    }
+
+    private static func setFailureBackoff(seconds: TimeInterval) {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveRetryAfter = Date().addingTimeInterval(min(max(seconds, liveFailureBackoff), maxFailureBackoff))
+    }
+
+    private static func clearFailureBackoff() {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveRetryAfter = nil
+    }
+
     func collect() async -> UsageSnapshot {
         guard AuthDetector.current().isConnected(.claude) else {
+            DebugLog.write("claude: not signed in (no auth files found)")
             return .disconnected(.claude)
         }
 
         if let cached = Self.freshLiveSnapshot() {
+            DebugLog.write("claude: serving fresh live cache (< \(Int(Self.liveMinInterval))s old)")
             return cached
+        }
+
+        if let until = Self.inFailureBackoff() {
+            DebugLog.write("claude: in live-fetch back-off after a recent failure"
+                + " (retrying in ~\(max(0, Int(until.timeIntervalSinceNow)))s) — not calling the API this tick")
+            if let stale = Self.lastLiveSnapshot() { return stale }
+            return estimatedSnapshot()
         }
 
         if let live = await liveSnapshot() {
             Self.storeLiveSnapshot(live)
+            Self.clearFailureBackoff()
+            DebugLog.write("claude: LIVE ok — 5h=\(pct(live.dailyPercent))"
+                + " week=\(pct(live.weeklyPercent)) plan=\(live.planLabel ?? "—")")
             return live
         }
 
         if let stale = Self.lastLiveSnapshot() {
+            DebugLog.write("claude: live fetch failed — serving STALE live cache"
+                + " (last live update \(stale.updatedAt))")
             return stale
         }
+
+        DebugLog.write("claude: live fetch failed and no cached live data —"
+            + " FALLING BACK to local token ESTIMATE (numbers are approximate)")
         return estimatedSnapshot()
+    }
+
+    private func pct(_ value: Double?) -> String {
+        value.map { String(format: "%.0f%%", $0) } ?? "—"
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
     }
 
     // MARK: Live API
 
     private func liveSnapshot() async -> UsageSnapshot? {
-        guard let credentials = ClaudeCredentials.currentNonBlocking() else { return nil }
+        guard let credentials = ClaudeCredentials.currentNonBlocking() else {
+            DebugLog.write("claude: no OAuth token available — skipping live API call"
+                + " (keychain not yet readable; see claude-cred logs above)")
+            return nil
+        }
+
+        if let expiry = credentials.expiryDate, expiry < Date() {
+            DebugLog.write("claude: WARNING — keychain token is EXPIRED (expired"
+                + " \(Self.timestamp(expiry))). This app only reads the token; Claude Code"
+                + " must refresh it. Sending anyway in case the server still honors it.")
+        }
 
         var request = URLRequest(url: Self.usageURL)
         request.timeoutInterval = 8
@@ -453,9 +576,33 @@ struct ClaudeUsageCollector: UsageCollecting {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse, http.statusCode == 200,
-              let usage = try? JSONDecoder().decode(LiveUsage.self, from: data) else {
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            DebugLog.write("claude: live request errored — \(error.localizedDescription)")
+            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
+            return nil
+        }
+
+        guard let http = response as? HTTPURLResponse else {
+            DebugLog.write("claude: live response was not HTTP")
+            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
+            return nil
+        }
+        guard http.statusCode == 200 else {
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+            DebugLog.write("claude: live API returned HTTP \(http.statusCode)"
+                + " (401 = token rejected/expired, 429 = rate-limited)"
+                + (retryAfter.map { "; Retry-After \(Int($0))s" } ?? ""))
+            Self.setFailureBackoff(seconds: retryAfter ?? Self.liveFailureBackoff)
+            return nil
+        }
+        guard let usage = try? JSONDecoder().decode(LiveUsage.self, from: data) else {
+            DebugLog.write("claude: live API 200 but response JSON did not decode"
+                + " (endpoint schema may have changed)")
+            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
             return nil
         }
 
@@ -558,6 +705,12 @@ struct ClaudeUsageCollector: UsageCollecting {
 
         let dailyPercent = min(100, Double(fiveHourTokens) / Double(fiveHourTokenBudget) * 100)
         let weeklyPercent = min(100, Double(weeklyTokens) / Double(weeklyTokenBudget) * 100)
+
+        DebugLog.write("claude: ESTIMATE — 5h \(fiveHourTokens)/\(fiveHourTokenBudget) tok"
+            + " = \(String(format: "%.0f%%", dailyPercent)),"
+            + " week \(weeklyTokens)/\(weeklyTokenBudget) tok"
+            + " = \(String(format: "%.0f%%", weeklyPercent))."
+            + " These are guesses vs assumed budgets, NOT real limits.")
 
         return UsageSnapshot(
             provider: .claude,

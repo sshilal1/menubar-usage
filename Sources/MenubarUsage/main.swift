@@ -19,6 +19,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // and exits. Handy for diagnostics and for confirming the data layer works
 // without launching the menu bar UI.
 if CommandLine.arguments.contains("--once") {
+    // Synchronously warm the Claude token first. On machines where the token lives
+    // only in the Keychain, the non-blocking GUI path always returns nil on first
+    // call, so without this the one-shot readout could never reach the live API.
+    ClaudeCredentials.prewarmBlocking()
     let store = UsageStore(collectors: [ClaudeUsageCollector(), CodexUsageCollector()])
     Task {
         let snapshots = await store.refresh()

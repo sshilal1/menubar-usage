@@ -59,6 +59,10 @@ cat > "$PLIST" <<PLIST_EOF
     <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/menubar-usage.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/menubar-usage.err.log</string>
 </dict>
 </plist>
 PLIST_EOF

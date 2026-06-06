@@ -18,6 +18,30 @@ MENUBAR_USAGE_DEBUG=1 .build/debug/menubar-usage --once   # + stderr tracing
 The installed copy runs via LaunchAgent `com.local.menubar-usage` (RunAtLoad +
 KeepAlive). After code changes, re-run `./scripts/install.sh` to update it.
 
+To restart the installed agent without a full reinstall:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.local.menubar-usage"
+```
+
+## Logging / diagnostics
+
+The app **always** writes a trace log to `~/Library/Logs/menubar-usage.log`
+(rotated to `…1.log` past 512 KB). This is the first place to look when the gauge
+shows wrong or estimated numbers — it records, per refresh, which path each
+provider took (live / stale cache / estimate) and *why* (keychain `OSStatus`,
+HTTP status, token expiry, back-off). The LaunchAgent also captures stdout/stderr
+to `~/Library/Logs/menubar-usage.{out,err}.log` for crashes.
+
+```bash
+tail -f ~/Library/Logs/menubar-usage.log     # watch live
+MENUBAR_USAGE_DEBUG=1 .build/release/menubar-usage --once   # also mirror to stderr
+```
+
+`--once` now calls `ClaudeCredentials.prewarmBlocking()` first, so on Keychain-only
+machines it can actually reach the live API (the GUI's non-blocking path returns
+nil on first call and would otherwise always print the estimate).
+
 ## Architecture (files in `Sources/MenubarUsage/`)
 
 - `UsageModel.swift` — `UsageSnapshot`, `Provider` (`.claude`, `.codex`),
@@ -60,6 +84,43 @@ KeepAlive). After code changes, re-run `./scripts/install.sh` to update it.
   run). The GUI app is fine because `app.run()` provides a live run loop.
 - **Ad-hoc signing** in `install.sh` gives the binary a stable identity so the
   Keychain "Always Allow" decision binds reliably (per build).
+- **Live-fetch back-off ≠ success throttle.** `liveMinInterval` (5 min) only
+  throttles *after* a successful fetch (it gates the success cache). A *failed*
+  fetch leaves no cache, so without a separate guard `collect()` would re-hit the
+  endpoint every 20s tick — which perpetuates a 429. `liveRetryAfter` /
+  `setFailureBackoff` adds that guard (90s default, or the server's `Retry-After`,
+  capped at 10 min). Don't fold the two together; they gate different states.
+
+## Troubleshooting: Claude shows `est.` or wrong numbers
+
+The Claude card label tells you the data source: a real plan name (`Pro`, `Max 20x`)
+means **live** API data; **`est.`** means it fell back to the local token estimate,
+which is a guess against assumed budgets (`claudeFiveHourTokenBudget` /
+`claudeWeeklyTokenBudget`) — it is routinely wrong, *especially weekly*, and
+fabricates the reset schedule. `est.` always means "the live fetch failed." Check
+`~/Library/Logs/menubar-usage.log` to see which of these it was:
+
+1. **Keychain prompt not approved.** This machine stores the Claude OAuth token
+   only in the Keychain (no `~/.claude/.credentials.json`). The first read pops
+   *"menubar-usage wants to use the Claude Code-credentials item"*; until you click
+   **Always Allow**, reads return nil and you get `est.`. Log shows
+   `claude-cred: keychain read FAILED — … (OSStatus -25308/-25293/-128)` or repeated
+   `no token yet (keychain read already in flight)` while the prompt sits unanswered.
+   *Fix:* approve the prompt. Ad-hoc signing changes the cdhash every build, so each
+   `./scripts/install.sh` re-triggers it (see open item #2).
+2. **Expired token.** The app only *reads* the token; **Claude Code refreshes it**.
+   If the Keychain copy is past `expiresAt`, the API rejects it (HTTP 401). Log shows
+   `claude: WARNING — keychain token is EXPIRED`. *Fix:* nothing in this app — use
+   Claude Code so it writes a fresh token to the Keychain, then the next refresh
+   picks it up.
+3. **Rate-limited (HTTP 429).** `oauth/usage` is aggressively throttled. Log shows
+   `claude: live API returned HTTP 429`. After any failure the app now backs off
+   (`liveFailureBackoff` = 90s, or the server's `Retry-After`) instead of re-hitting
+   every 20s tick — important, because hammering a 429 perpetuates it. *Fix:* wait;
+   it self-recovers and logs `LIVE ok`.
+
+After fixing, click the gauge (or `kickstart -k`) to force a refresh and watch the
+log flip from `ESTIMATE` to `LIVE ok`.
 
 ## What's next / open items
 
@@ -76,8 +137,9 @@ KeepAlive). After code changes, re-run `./scripts/install.sh` to update it.
    which window the gauge prioritizes), a proper `.app` bundle + custom icon, and
    unit tests for the JSONL/rollout parsers.
 4. **Endpoint fragility:** `wham/usage` and `oauth/usage` are unofficial. If numbers
-   stop updating, verify those endpoints and the token files first (`--once` +
-   `MENUBAR_USAGE_DEBUG=1` are the fastest way to see what each collector returns).
+   stop updating, check `~/Library/Logs/menubar-usage.log` first (it records the HTTP
+   status, token state, and which fallback ran), then verify those endpoints and the
+   token files (`--once` + `MENUBAR_USAGE_DEBUG=1` mirror the same trace to stderr).
 
 ## Conventions
 - Keep the data layer faithful to upstream behavior (caching intervals, fallbacks);

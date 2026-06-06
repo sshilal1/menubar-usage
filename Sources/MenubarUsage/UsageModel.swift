@@ -251,13 +251,67 @@ final class UsageStore: @unchecked Sendable {
     }
 }
 
-/// Unbuffered stderr tracing, gated on the MENUBAR_USAGE_DEBUG env var.
+/// Diagnostic tracing for understanding *why* a provider shows stale or estimated
+/// data instead of live numbers.
+///
+/// Always appends to a log file at `~/Library/Logs/menubar-usage.log` (open it in
+/// Console.app or `tail -f` it). This matters because the installed build runs as a
+/// LaunchAgent with no terminal and no `MENUBAR_USAGE_DEBUG`, so the old
+/// stderr-only, env-gated tracing meant every failure was completely invisible.
+/// Still also mirrors to stderr when `MENUBAR_USAGE_DEBUG` is set, which is handy
+/// with `--once`. The file is size-capped and rotated once so it can't grow without
+/// bound.
 enum DebugLog {
-    nonisolated(unsafe) static let enabled = ProcessInfo.processInfo.environment["MENUBAR_USAGE_DEBUG"] != nil
+    static let stderrEnabled =
+        ProcessInfo.processInfo.environment["MENUBAR_USAGE_DEBUG"] != nil
+
+    private static let lock = NSLock()
+    private static let maxBytes: UInt64 = 512 * 1024
+
+    /// `~/Library/Logs/menubar-usage.log` — the standard macOS user log location.
+    static let fileURL: URL = {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("menubar-usage.log")
+    }()
+
+    // Guarded by `lock`; DateFormatter is not thread-safe so all use is serialized.
+    private static let timestampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return f
+    }()
+
     static func write(_ message: String) {
-        guard enabled else { return }
-        let line = "[\(Date().timeIntervalSince1970)] \(message)\n"
-        FileHandle.standardError.write(line.data(using: .utf8)!)
+        lock.lock()
+        defer { lock.unlock() }
+
+        let line = "[\(timestampFormatter.string(from: Date()))] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+
+        if stderrEnabled { FileHandle.standardError.write(data) }
+
+        rotateIfNeeded()
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: fileURL.path) {
+            fm.createFile(atPath: fileURL.path, contents: nil)
+        }
+        if let handle = try? FileHandle(forWritingTo: fileURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            handle.write(data)
+        }
+    }
+
+    /// Rolls `menubar-usage.log` to `menubar-usage.1.log` once it exceeds `maxBytes`.
+    private static func rotateIfNeeded() {
+        let fm = FileManager.default
+        guard let size = (try? fm.attributesOfItem(atPath: fileURL.path)[.size]) as? UInt64,
+              size > maxBytes else { return }
+        let rotated = fileURL.deletingPathExtension().appendingPathExtension("1.log")
+        try? fm.removeItem(at: rotated)
+        try? fm.moveItem(at: fileURL, to: rotated)
     }
 }
 
