@@ -123,6 +123,9 @@ final class ProviderLogoView: NSView {
 /// the real desktop-app glyph (falling back to the badge when not installed).
 enum ProviderBranding {
     static func appIcon(for provider: Provider) -> NSImage? {
+        if getenv("MENUBAR_USAGE_FORCE_FALLBACK_ICONS") != nil {
+            return nil
+        }
         let bundleID: String
         let fallbackPath: String
         switch provider {
