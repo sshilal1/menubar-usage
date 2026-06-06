@@ -1,15 +1,15 @@
 # Menubar Usage
 
-<p align="center">
-  <img src="assets/both-preview.png" alt="Menubar Usage showing Claude and ChatGPT limits in the macOS menu bar" width="700">
-</p>
-
 Tiny macOS menu bar gauges for your **Claude** and **ChatGPT / Codex** usage.
 
 Menubar Usage shows both the rolling **5-hour** and **weekly** limits directly in
 the menu bar, with a click-through popover for exact percentages, reset times,
 plan labels, and refresh status. It is menu-bar-only, has no Dock icon, and reads
 from the accounts you are already signed into locally.
+
+<p align="center">
+  <img src="assets/both-preview.png" alt="Menubar Usage showing Claude and ChatGPT limits in the macOS menu bar" width="300">
+</p>
 
 ## Features
 
