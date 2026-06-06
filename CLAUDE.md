@@ -60,7 +60,12 @@ nil on first call and would otherwise always print the estimate).
 ### Data sources (all local, authenticated, no scraping)
 - **Claude:** `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token
   from `~/.claude/.credentials.json` **or the macOS Keychain** (`Claude
-  Code-credentials`). Offline fallback: token estimate from `~/.claude/projects`.
+  Code-credentials`). The access token is short-lived (~8h); when it's expired the
+  app **refreshes it itself** via `POST https://platform.claude.com/v1/oauth/token`
+  (client id `9d1c250a-…`, the value baked into the Claude Code binary) using the
+  stored refresh token, and writes the rotated credential back to the Keychain so
+  the CLI and this app stay in sync. Offline fallback: token estimate from
+  `~/.claude/projects`.
 - **ChatGPT:** `GET https://chatgpt.com/backend-api/wham/usage` with the token in
   `~/.codex/auth.json`. Offline fallback: `~/.codex/sessions/**/rollout-*.jsonl`.
 
@@ -84,6 +89,13 @@ nil on first call and would otherwise always print the estimate).
   run). The GUI app is fine because `app.run()` provides a live run loop.
 - **Ad-hoc signing** in `install.sh` gives the binary a stable identity so the
   Keychain "Always Allow" decision binds reliably (per build).
+- **Token refresh writes back to the shared Keychain item.** When the access token
+  is expired, `ClaudeCredentials.refreshIfPossible` mints a new one and persists it
+  via `SecItemUpdate` (in-place, so the ACL is preserved) into the *same* `Claude
+  Code-credentials` item the CLI uses. Refresh tokens **rotate** (the old one dies
+  once a new one is issued), so it first probes write access with a no-op
+  `SecItemUpdate` and bails if that fails — otherwise a refresh we can't save would
+  invalidate the CLI's login. Writeback preserves any sibling top-level JSON keys.
 - **Live-fetch back-off ≠ success throttle.** `liveMinInterval` (5 min) only
   throttles *after* a successful fetch (it gates the success cache). A *failed*
   fetch leaves no cache, so without a separate guard `collect()` would re-hit the
@@ -108,11 +120,16 @@ fabricates the reset schedule. `est.` always means "the live fetch failed." Chec
    `no token yet (keychain read already in flight)` while the prompt sits unanswered.
    *Fix:* approve the prompt. Ad-hoc signing changes the cdhash every build, so each
    `./scripts/install.sh` re-triggers it (see open item #2).
-2. **Expired token.** The app only *reads* the token; **Claude Code refreshes it**.
-   If the Keychain copy is past `expiresAt`, the API rejects it (HTTP 401). Log shows
-   `claude: WARNING — keychain token is EXPIRED`. *Fix:* nothing in this app — use
-   Claude Code so it writes a fresh token to the Keychain, then the next refresh
-   picks it up.
+2. **Expired token.** The access token is short-lived (~8h). The app now **refreshes
+   it automatically** with the stored refresh token (`refreshIfPossible`) and writes
+   the new credential back to the Keychain. Log shows `claude: access token
+   expired/expiring — refreshing` → `claude-cred: token REFRESHED ok`. This needs
+   *write* access to the Keychain item, so the first refresh may prompt a second time
+   (*"…wants to modify…"*) — click **Always Allow**. If refresh returns non-200
+   (`token refresh FAILED — HTTP 4xx`), the refresh token itself is revoked: re-login
+   Claude Code (`claude`). Safety: the app probes Keychain writability *before*
+   refreshing, so it never rotates a token it can't persist (which would break your
+   CLI login).
 3. **Rate-limited (HTTP 429).** `oauth/usage` is aggressively throttled. Log shows
    `claude: live API returned HTTP 429`. After any failure the app now backs off
    (`liveFailureBackoff` = 90s, or the server's `Retry-After`) instead of re-hitting

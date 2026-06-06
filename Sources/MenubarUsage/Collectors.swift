@@ -271,16 +271,30 @@ struct CodexUsageCollector: UsageCollecting {
 /// `~/.claude/.credentials.json` file (no Keychain prompt) and falling back to
 /// the Keychain only when the file is absent. Cached in memory until near expiry.
 enum ClaudeCredentials {
-    struct OAuth: Decodable {
+    struct OAuth: Codable {
         let accessToken: String
+        let refreshToken: String?
         let subscriptionType: String?
         /// Unix epoch in milliseconds when the access token expires.
         let expiresAt: Double?
+        let scopes: [String]?
+        let rateLimitTier: String?
 
         var expiryDate: Date? {
             expiresAt.map { Date(timeIntervalSince1970: $0 / 1000) }
         }
+
+        var isExpired: Bool {
+            guard let expiry = expiryDate else { return false }
+            return expiry.timeIntervalSinceNow < 120
+        }
     }
+
+    // OAuth refresh endpoint + public client id, taken from the Claude Code binary
+    // (`platform.claude.com/v1/oauth/token`). The access token is short-lived (~8h);
+    // this app refreshes it with the stored refresh token, just like the CLI.
+    private static let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+    private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
     private static let lock = NSLock()
     private nonisolated(unsafe) static var cached: OAuth?
@@ -399,7 +413,7 @@ enum ClaudeCredentials {
         return f.string(from: date)
     }
 
-    private struct Wrapper: Decodable { let claudeAiOauth: OAuth }
+    private struct Wrapper: Codable { let claudeAiOauth: OAuth }
 
     private static func readFromFile() -> OAuth? {
         let paths = [
@@ -430,6 +444,145 @@ enum ClaudeCredentials {
             return (nil, status)
         }
         return (try? JSONDecoder().decode(Wrapper.self, from: data).claudeAiOauth, status)
+    }
+
+    // MARK: Refresh
+
+    private struct TokenResponse: Decodable {
+        let access_token: String
+        let refresh_token: String?
+        let expires_in: Double?
+    }
+
+    /// Synchronous cache update (NSLock can't be held across an async boundary).
+    private static func storeCached(_ oauth: OAuth) {
+        lock.lock()
+        cached = oauth
+        keychainRetryAfter = nil
+        lock.unlock()
+    }
+
+    /// Exchanges the stored refresh token for a fresh access token (the same flow
+    /// Claude Code uses) and writes the rotated credential back to the Keychain so
+    /// the CLI and this app stay in sync. Returns the new token, or nil on failure.
+    ///
+    /// Safety: refresh tokens rotate (the old one is invalidated once a new one is
+    /// issued), so we **first probe that we can write the Keychain** and bail out if
+    /// not — otherwise we'd consume the refresh token without being able to save the
+    /// replacement, breaking the user's Claude Code login. A *rejected* refresh
+    /// request does not consume the token.
+    static func refreshIfPossible(_ current: OAuth) async -> OAuth? {
+        guard let refreshToken = current.refreshToken else {
+            DebugLog.write("claude-cred: cannot refresh — no refresh token in keychain")
+            return nil
+        }
+        guard keychainIsWritable() else {
+            DebugLog.write("claude-cred: keychain is not writable — aborting refresh so we don't"
+                + " rotate a token we can't persist. Re-login Claude Code (`claude`) to restore live data.")
+            return nil
+        }
+
+        var request = URLRequest(url: tokenURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": clientID
+        ])
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            DebugLog.write("claude-cred: token refresh request errored — \(error.localizedDescription)")
+            return nil
+        }
+        guard let http = response as? HTTPURLResponse else { return nil }
+        guard http.statusCode == 200,
+              let token = try? JSONDecoder().decode(TokenResponse.self, from: data) else {
+            DebugLog.write("claude-cred: token refresh FAILED — HTTP \(http.statusCode)."
+                + " The refresh token may be revoked; re-login Claude Code (`claude`).")
+            return nil
+        }
+
+        let expiresAtMs = Date().addingTimeInterval(token.expires_in ?? 28_800)
+            .timeIntervalSince1970 * 1000
+        let refreshed = OAuth(
+            accessToken: token.access_token,
+            refreshToken: token.refresh_token ?? refreshToken,
+            subscriptionType: current.subscriptionType,
+            expiresAt: expiresAtMs,
+            scopes: current.scopes,
+            rateLimitTier: current.rateLimitTier
+        )
+
+        let persisted = writeToKeychain(refreshed)
+        storeCached(refreshed)
+
+        DebugLog.write("claude-cred: token REFRESHED ok (new expiry"
+            + " \(timestamp(refreshed.expiryDate ?? Date()))); keychain write"
+            + " \(persisted ? "ok" : "FAILED — will retry refresh next time")")
+        return refreshed
+    }
+
+    /// Confirms we have update authority on the item by rewriting its current data
+    /// unchanged. Harmless on success; lets us bail before consuming a refresh token.
+    private static func keychainIsWritable() -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return false }
+        let updateQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials"
+        ]
+        let status = SecItemUpdate(updateQuery as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        return status == errSecSuccess
+    }
+
+    /// Writes the refreshed credential back into the Keychain item, preserving any
+    /// sibling top-level keys so we don't clobber other data Claude Code may store.
+    @discardableResult
+    private static func writeToKeychain(_ oauth: OAuth) -> Bool {
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials"
+        ]
+
+        var root: [String: Any] = [:]
+        var readQuery = baseQuery
+        readQuery[kSecReturnData as String] = true
+        readQuery[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        if SecItemCopyMatching(readQuery as CFDictionary, &item) == errSecSuccess,
+           let data = item as? Data,
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            root = obj
+        }
+
+        var oauthDict: [String: Any] = ["accessToken": oauth.accessToken]
+        if let v = oauth.refreshToken { oauthDict["refreshToken"] = v }
+        if let v = oauth.expiresAt { oauthDict["expiresAt"] = Int(v) }
+        if let v = oauth.subscriptionType { oauthDict["subscriptionType"] = v }
+        if let v = oauth.scopes { oauthDict["scopes"] = v }
+        if let v = oauth.rateLimitTier { oauthDict["rateLimitTier"] = v }
+        root["claudeAiOauth"] = oauthDict
+
+        guard let newData = try? JSONSerialization.data(withJSONObject: root) else { return false }
+        let status = SecItemUpdate(baseQuery as CFDictionary, [kSecValueData as String: newData] as CFDictionary)
+        if status != errSecSuccess {
+            DebugLog.write("claude-cred: SecItemUpdate failed — \(keychainErrorText(status))")
+            return false
+        }
+        return true
     }
 }
 
@@ -557,18 +710,59 @@ struct ClaudeUsageCollector: UsageCollecting {
     // MARK: Live API
 
     private func liveSnapshot() async -> UsageSnapshot? {
-        guard let credentials = ClaudeCredentials.currentNonBlocking() else {
+        guard var credentials = ClaudeCredentials.currentNonBlocking() else {
             DebugLog.write("claude: no OAuth token available — skipping live API call"
                 + " (keychain not yet readable; see claude-cred logs above)")
             return nil
         }
 
-        if let expiry = credentials.expiryDate, expiry < Date() {
-            DebugLog.write("claude: WARNING — keychain token is EXPIRED (expired"
-                + " \(Self.timestamp(expiry))). This app only reads the token; Claude Code"
-                + " must refresh it. Sending anyway in case the server still honors it.")
+        // Proactively refresh an expired/expiring access token before the API call.
+        if credentials.isExpired {
+            DebugLog.write("claude: access token expired/expiring (expires"
+                + " \(Self.timestamp(credentials.expiryDate ?? Date()))) — refreshing before live call")
+            guard let refreshed = await ClaudeCredentials.refreshIfPossible(credentials) else {
+                Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
+                return nil
+            }
+            credentials = refreshed
         }
 
+        var result = await fetchUsage(credentials: credentials)
+
+        // A 401 despite the expiry check (clock skew / server-side revocation):
+        // force a single refresh + retry.
+        if result.status == 401 {
+            DebugLog.write("claude: live API 401 — forcing a token refresh and one retry")
+            if let refreshed = await ClaudeCredentials.refreshIfPossible(credentials) {
+                credentials = refreshed
+                result = await fetchUsage(credentials: credentials)
+            }
+        }
+
+        guard result.status == 200 else {
+            DebugLog.write("claude: live API returned HTTP \(result.status)"
+                + " (401 = token rejected/expired, 429 = rate-limited)"
+                + (result.retryAfter.map { "; Retry-After \(Int($0))s" } ?? ""))
+            Self.setFailureBackoff(seconds: result.retryAfter ?? Self.liveFailureBackoff)
+            return nil
+        }
+        guard let snapshot = result.snapshot else {
+            DebugLog.write("claude: live API 200 but response was unusable (decode failed)")
+            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
+            return nil
+        }
+        return snapshot
+    }
+
+    private struct FetchResult {
+        let snapshot: UsageSnapshot?
+        let status: Int            // HTTP status; negative for transport errors
+        let retryAfter: TimeInterval?
+    }
+
+    /// One `GET oauth/usage` call with the given token. No retry/backoff logic here —
+    /// the caller decides based on `status` (so it can refresh + retry on 401).
+    private func fetchUsage(credentials: ClaudeCredentials.OAuth) async -> FetchResult {
         var request = URLRequest(url: Self.usageURL)
         request.timeoutInterval = 8
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -582,28 +776,18 @@ struct ClaudeUsageCollector: UsageCollecting {
             (data, response) = try await URLSession.shared.data(for: request)
         } catch {
             DebugLog.write("claude: live request errored — \(error.localizedDescription)")
-            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
-            return nil
+            return FetchResult(snapshot: nil, status: -1, retryAfter: nil)
         }
-
         guard let http = response as? HTTPURLResponse else {
             DebugLog.write("claude: live response was not HTTP")
-            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
-            return nil
+            return FetchResult(snapshot: nil, status: -2, retryAfter: nil)
         }
+        let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
         guard http.statusCode == 200 else {
-            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
-            DebugLog.write("claude: live API returned HTTP \(http.statusCode)"
-                + " (401 = token rejected/expired, 429 = rate-limited)"
-                + (retryAfter.map { "; Retry-After \(Int($0))s" } ?? ""))
-            Self.setFailureBackoff(seconds: retryAfter ?? Self.liveFailureBackoff)
-            return nil
+            return FetchResult(snapshot: nil, status: http.statusCode, retryAfter: retryAfter)
         }
         guard let usage = try? JSONDecoder().decode(LiveUsage.self, from: data) else {
-            DebugLog.write("claude: live API 200 but response JSON did not decode"
-                + " (endpoint schema may have changed)")
-            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
-            return nil
+            return FetchResult(snapshot: nil, status: 200, retryAfter: nil)
         }
 
         let isoFormatter = ISO8601DateFormatter()
@@ -616,7 +800,7 @@ struct ClaudeUsageCollector: UsageCollecting {
         let plan = credentials.subscriptionType
             .map { $0.replacingOccurrences(of: "_", with: " ").capitalized }
 
-        return UsageSnapshot(
+        let snapshot = UsageSnapshot(
             provider: .claude,
             isConnected: true,
             dailyPercent: usage.five_hour?.utilization,
@@ -628,6 +812,7 @@ struct ClaudeUsageCollector: UsageCollecting {
             updatedAt: Date(),
             error: nil
         )
+        return FetchResult(snapshot: snapshot, status: 200, retryAfter: nil)
     }
 
     // MARK: Local fallback estimate
