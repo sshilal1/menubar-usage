@@ -58,14 +58,16 @@ nil on first call and would otherwise always print the estimate).
 - `main.swift` — `@main` accessory app + the `--once` CLI path.
 
 ### Data sources (all local, authenticated, no scraping)
-- **Claude:** `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token
-  from `~/.claude/.credentials.json` **or the macOS Keychain** (`Claude
-  Code-credentials`). The access token is short-lived (~8h); when it's expired the
-  app **refreshes it itself** via `POST https://platform.claude.com/v1/oauth/token`
-  (client id `9d1c250a-…`, the value baked into the Claude Code binary) using the
-  stored refresh token, and writes the rotated credential back to the Keychain so
-  the CLI and this app stay in sync. Offline fallback: token estimate from
-  `~/.claude/projects`.
+- **Claude:** `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token.
+  Token sources, in order: the app's **own copy** at
+  `~/.config/menubar-usage/credentials.json`, then `~/.claude/.credentials.json`,
+  then the macOS **Keychain** (`Claude Code-credentials`, read once to bootstrap the
+  app copy). The access token is short-lived (~8h); when it's expired the app
+  **refreshes it itself** via `POST https://platform.claude.com/v1/oauth/token`
+  (client id `9d1c250a-…`, baked into the Claude Code binary) using the stored
+  refresh token, and writes the new credential to its **own file** (`writeToFile`) —
+  **not** back to the Keychain (see the prompt-fatigue gotcha). Offline fallback:
+  token estimate from `~/.claude/projects`.
 - **ChatGPT:** `GET https://chatgpt.com/backend-api/wham/usage` with the token in
   `~/.codex/auth.json`. Offline fallback: `~/.codex/sessions/**/rollout-*.jsonl`.
 
@@ -89,13 +91,19 @@ nil on first call and would otherwise always print the estimate).
   run). The GUI app is fine because `app.run()` provides a live run loop.
 - **Ad-hoc signing** in `install.sh` gives the binary a stable identity so the
   Keychain "Always Allow" decision binds reliably (per build).
-- **Token refresh writes back to the shared Keychain item.** When the access token
-  is expired, `ClaudeCredentials.refreshIfPossible` mints a new one and persists it
-  via `SecItemUpdate` (in-place, so the ACL is preserved) into the *same* `Claude
-  Code-credentials` item the CLI uses. Refresh tokens **rotate** (the old one dies
-  once a new one is issued), so it first probes write access with a no-op
-  `SecItemUpdate` and bails if that fails — otherwise a refresh we can't save would
-  invalidate the CLI's login. Writeback preserves any sibling top-level JSON keys.
+- **Refreshed tokens go to our own file, NOT the Keychain — to avoid prompt fatigue.**
+  Reading another app's Keychain item is fine after one "Always Allow", but
+  *modifying* it (`SecItemUpdate`) re-prompts **every session**. We hit this: the
+  earlier design wrote the rotated token back to `Claude Code-credentials` and the
+  user got "menubar-usage wants to modify…" on every laptop wake (~once per 8h token
+  expiry). Fix: `refreshIfPossible` writes the new credential to
+  `~/.config/menubar-usage/credentials.json` (`writeToFile`, mode 0600), and
+  `readFromFile` reads that **first**. The Keychain is now **read-only** (one bootstrap
+  read, also mirrored into our file). Both reference projects avoid Keychain writes
+  too — `neelashkannan/usage-touchbar` is read-only with no refresh, and
+  `Artzainnn/ClaudeUsageBar` uses a pasted `claude.ai` cookie. **Trade-off:** refresh
+  tokens rotate, so the CLI's Keychain copy drifts out of date; the `claude` CLI may
+  ask you to log in once. Acceptable since the gauge's whole job is to *read* usage.
 - **Live-fetch back-off ≠ success throttle.** `liveMinInterval` (5 min) only
   throttles *after* a successful fetch (it gates the success cache). A *failed*
   fetch leaves no cache, so without a separate guard `collect()` would re-hit the
@@ -112,24 +120,24 @@ which is a guess against assumed budgets (`claudeFiveHourTokenBudget` /
 fabricates the reset schedule. `est.` always means "the live fetch failed." Check
 `~/Library/Logs/menubar-usage.log` to see which of these it was:
 
-1. **Keychain prompt not approved.** This machine stores the Claude OAuth token
-   only in the Keychain (no `~/.claude/.credentials.json`). The first read pops
-   *"menubar-usage wants to use the Claude Code-credentials item"*; until you click
-   **Always Allow**, reads return nil and you get `est.`. Log shows
-   `claude-cred: keychain read FAILED — … (OSStatus -25308/-25293/-128)` or repeated
-   `no token yet (keychain read already in flight)` while the prompt sits unanswered.
-   *Fix:* approve the prompt. Ad-hoc signing changes the cdhash every build, so each
-   `./scripts/install.sh` re-triggers it (see open item #2).
-2. **Expired token.** The access token is short-lived (~8h). The app now **refreshes
-   it automatically** with the stored refresh token (`refreshIfPossible`) and writes
-   the new credential back to the Keychain. Log shows `claude: access token
-   expired/expiring — refreshing` → `claude-cred: token REFRESHED ok`. This needs
-   *write* access to the Keychain item, so the first refresh may prompt a second time
-   (*"…wants to modify…"*) — click **Always Allow**. If refresh returns non-200
-   (`token refresh FAILED — HTTP 4xx`), the refresh token itself is revoked: re-login
-   Claude Code (`claude`). Safety: the app probes Keychain writability *before*
-   refreshing, so it never rotates a token it can't persist (which would break your
-   CLI login).
+1. **No token yet (Keychain bootstrap).** If `~/.config/menubar-usage/credentials.json`
+   doesn't exist yet, the app does a one-time Keychain read to seed it, which pops
+   *"menubar-usage wants to use the Claude Code-credentials item"* — click **Always
+   Allow** once. Log shows `claude-cred: keychain read FAILED — … (OSStatus
+   -25308/-25293/-128)` if denied, or `keychain read OK … cached to file` on success.
+   After that the app reads its own file and never prompts again. (Ad-hoc signing
+   changes the cdhash each build, so a *reinstall* can re-trigger this one read — see
+   open item #2. To skip even that, pre-seed the file:
+   `security find-generic-password -s "Claude Code-credentials" -w >
+   ~/.config/menubar-usage/credentials.json && chmod 600 …`.)
+2. **Expired token.** The access token is short-lived (~8h). The app **refreshes it
+   automatically** with the stored refresh token (`refreshIfPossible`) and saves the
+   new credential to **its own file** (no Keychain write → no prompt). Log shows
+   `claude: access token expired/expiring — refreshing` → `claude-cred: token
+   REFRESHED ok … file write ok`. If refresh returns non-200 (`token refresh FAILED —
+   HTTP 4xx`), the refresh token is revoked: re-login Claude Code (`claude`), which
+   rewrites the Keychain — then delete `~/.config/menubar-usage/credentials.json` so
+   the app re-bootstraps from it.
 3. **Rate-limited (HTTP 429).** `oauth/usage` is aggressively throttled. Log shows
    `claude: live API returned HTTP 429`. After any failure the app now backs off
    (`liveFailureBackoff` = 90s, or the server's `Retry-After`) instead of re-hitting
@@ -141,14 +149,15 @@ log flip from `ESTIMATE` to `LIVE ok`.
 
 ## What's next / open items
 
-1. **[User action] Approve the Keychain prompt once** (*"menubar-usage wants to use
-   the Claude Code-credentials keychain item"* → **Always Allow**). Until then the
-   Claude gauge shows the local estimate (`est.` in the popover), not live numbers.
-   After approving, click the gauge to force a refresh and confirm `est.` → live.
-2. **Re-prompt on every reinstall.** Ad-hoc signing changes the cdhash each build,
-   so `./scripts/install.sh` re-triggers the Keychain prompt. To make "Always Allow"
-   survive updates, sign with a stable self-signed code-signing certificate instead
-   of ad-hoc. Not done yet (personal-use tradeoff).
+1. **[User action] Approve the one-time Keychain bootstrap prompt** (*"menubar-usage
+   wants to use the Claude Code-credentials keychain item"* → **Always Allow**) the
+   first time, *or* pre-seed `~/.config/menubar-usage/credentials.json` (see
+   Troubleshooting #1). After that the app is file-based and never prompts again.
+2. **Re-prompt on every reinstall.** Ad-hoc signing changes the cdhash each build, so
+   `./scripts/install.sh` can re-trigger the one bootstrap Keychain *read* (not the
+   per-session write — that's gone). A stable self-signed code-signing certificate
+   would make "Always Allow" survive updates; pre-seeding the file sidesteps it
+   entirely. Not done yet (personal-use tradeoff).
 3. **Nice-to-haves (not started):** numeric `%` next to the gauges (toggle), a
    low-limit notification (e.g. >85%), a small Preferences UI (refresh interval,
    which window the gauge prioritizes), a proper `.app` bundle + custom icon, and

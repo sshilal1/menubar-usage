@@ -340,22 +340,28 @@ enum ClaudeCredentials {
         if shouldStartRead {
             DebugLog.write("claude-cred: starting background keychain read for 'Claude Code-credentials'")
             DispatchQueue.global(qos: .userInitiated).async {
-                let (result, status) = readFromKeychain() // may show a one-time prompt
+                let (result, status) = readFromKeychain() // one-time bootstrap prompt
                 lock.lock()
                 if let result {
                     cached = result
                     keychainRetryAfter = nil
-                    DebugLog.write("claude-cred: keychain read OK — token acquired"
-                        + " (expires \(result.expiryDate.map { timestamp($0) } ?? "?"))")
                 } else {
                     // Denied / unavailable: back off before prompting again.
                     keychainRetryAfter = Date().addingTimeInterval(keychainCooldown)
+                }
+                keychainReading = false
+                lock.unlock()
+
+                if let result {
+                    // Seed our own file so subsequent runs never read the Keychain again.
+                    writeToFile(result)
+                    DebugLog.write("claude-cred: keychain read OK — token acquired"
+                        + " (expires \(result.expiryDate.map { timestamp($0) } ?? "?")); cached to file")
+                } else {
                     DebugLog.write("claude-cred: keychain read FAILED — \(keychainErrorText(status));"
                         + " backing off \(Int(keychainCooldown))s before retry."
                         + " The Claude gauge will show the local estimate until this succeeds.")
                 }
-                keychainReading = false
-                lock.unlock()
             }
         } else if current == nil {
             DebugLog.write("claude-cred: no token yet"
@@ -390,13 +396,14 @@ enum ClaudeCredentials {
         DebugLog.write("claude-cred: [--once] blocking keychain read (may prompt)…")
         let (result, status) = readFromKeychain()
         lock.lock()
+        if let result { cached = result }
+        lock.unlock()
         if let result {
-            cached = result
-            DebugLog.write("claude-cred: [--once] keychain read OK — token acquired")
+            writeToFile(result)
+            DebugLog.write("claude-cred: [--once] keychain read OK — token acquired; cached to file")
         } else {
             DebugLog.write("claude-cred: [--once] keychain read FAILED — \(keychainErrorText(status))")
         }
-        lock.unlock()
     }
 
     /// Human-readable `(message + numeric code)` for a Keychain `OSStatus`, e.g.
@@ -415,18 +422,48 @@ enum ClaudeCredentials {
 
     private struct Wrapper: Codable { let claudeAiOauth: OAuth }
 
+    /// The app's OWN copy of the credential, kept current on every refresh. We read
+    /// this **first** (a plain file read never prompts) and only touch the Keychain
+    /// to bootstrap it. Refreshed tokens are written *here*, never back to Claude
+    /// Code's Keychain item — modifying that item re-prompts every session, which is
+    /// the whole problem this avoids. (ChatGPT/Codex never prompts for the same
+    /// reason: its token is a plain file at `~/.codex/auth.json`.)
+    private static var appCredentialsPath: String {
+        DataFiles.expand("~/.config/menubar-usage/credentials.json")
+    }
+
     private static func readFromFile() -> OAuth? {
         let paths = [
-            "~/.claude/.credentials.json",
-            "~/.config/claude/credentials.json"
+            appCredentialsPath,
+            DataFiles.expand("~/.claude/.credentials.json"),
+            DataFiles.expand("~/.config/claude/credentials.json")
         ]
         for path in paths {
-            guard let data = FileManager.default.contents(atPath: DataFiles.expand(path)) else { continue }
+            guard let data = FileManager.default.contents(atPath: path) else { continue }
             if let oauth = try? JSONDecoder().decode(Wrapper.self, from: data).claudeAiOauth {
                 return oauth
             }
         }
         return nil
+    }
+
+    /// Persists the credential to the app's own file (mode 0600). Never touches the
+    /// Keychain, so it never prompts.
+    @discardableResult
+    private static func writeToFile(_ oauth: OAuth) -> Bool {
+        let dir = DataFiles.expand("~/.config/menubar-usage")
+        try? FileManager.default.createDirectory(
+            atPath: dir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        guard let data = try? JSONEncoder().encode(Wrapper(claudeAiOauth: oauth)) else { return false }
+        try? FileManager.default.removeItem(atPath: appCredentialsPath)
+        return FileManager.default.createFile(
+            atPath: appCredentialsPath,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        )
     }
 
     /// Reads the token from the Keychain, returning both the decoded OAuth (if any)
@@ -463,22 +500,17 @@ enum ClaudeCredentials {
     }
 
     /// Exchanges the stored refresh token for a fresh access token (the same flow
-    /// Claude Code uses) and writes the rotated credential back to the Keychain so
-    /// the CLI and this app stay in sync. Returns the new token, or nil on failure.
+    /// Claude Code uses) and saves it to the app's own credentials file. Returns the
+    /// new token, or nil on failure.
     ///
-    /// Safety: refresh tokens rotate (the old one is invalidated once a new one is
-    /// issued), so we **first probe that we can write the Keychain** and bail out if
-    /// not — otherwise we'd consume the refresh token without being able to save the
-    /// replacement, breaking the user's Claude Code login. A *rejected* refresh
-    /// request does not consume the token.
+    /// We deliberately do **not** write the new token back into Claude Code's
+    /// Keychain item: modifying another app's Keychain item re-prompts the user every
+    /// session (that's the bug this avoids). The trade-off is that the CLI's Keychain
+    /// copy can drift, so the `claude` CLI may ask you to log in again once. A
+    /// rejected refresh request does not consume the refresh token.
     static func refreshIfPossible(_ current: OAuth) async -> OAuth? {
         guard let refreshToken = current.refreshToken else {
-            DebugLog.write("claude-cred: cannot refresh — no refresh token in keychain")
-            return nil
-        }
-        guard keychainIsWritable() else {
-            DebugLog.write("claude-cred: keychain is not writable — aborting refresh so we don't"
-                + " rotate a token we can't persist. Re-login Claude Code (`claude`) to restore live data.")
+            DebugLog.write("claude-cred: cannot refresh — no refresh token available")
             return nil
         }
 
@@ -519,70 +551,13 @@ enum ClaudeCredentials {
             rateLimitTier: current.rateLimitTier
         )
 
-        let persisted = writeToKeychain(refreshed)
+        let persisted = writeToFile(refreshed)
         storeCached(refreshed)
 
         DebugLog.write("claude-cred: token REFRESHED ok (new expiry"
-            + " \(timestamp(refreshed.expiryDate ?? Date()))); keychain write"
-            + " \(persisted ? "ok" : "FAILED — will retry refresh next time")")
+            + " \(timestamp(refreshed.expiryDate ?? Date()))); file write"
+            + " \(persisted ? "ok" : "FAILED — will retry refresh next tick")")
         return refreshed
-    }
-
-    /// Confirms we have update authority on the item by rewriting its current data
-    /// unchanged. Harmless on success; lets us bail before consuming a refresh token.
-    private static func keychainIsWritable() -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return false }
-        let updateQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials"
-        ]
-        let status = SecItemUpdate(updateQuery as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        return status == errSecSuccess
-    }
-
-    /// Writes the refreshed credential back into the Keychain item, preserving any
-    /// sibling top-level keys so we don't clobber other data Claude Code may store.
-    @discardableResult
-    private static func writeToKeychain(_ oauth: OAuth) -> Bool {
-        let baseQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials"
-        ]
-
-        var root: [String: Any] = [:]
-        var readQuery = baseQuery
-        readQuery[kSecReturnData as String] = true
-        readQuery[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        if SecItemCopyMatching(readQuery as CFDictionary, &item) == errSecSuccess,
-           let data = item as? Data,
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            root = obj
-        }
-
-        var oauthDict: [String: Any] = ["accessToken": oauth.accessToken]
-        if let v = oauth.refreshToken { oauthDict["refreshToken"] = v }
-        if let v = oauth.expiresAt { oauthDict["expiresAt"] = Int(v) }
-        if let v = oauth.subscriptionType { oauthDict["subscriptionType"] = v }
-        if let v = oauth.scopes { oauthDict["scopes"] = v }
-        if let v = oauth.rateLimitTier { oauthDict["rateLimitTier"] = v }
-        root["claudeAiOauth"] = oauthDict
-
-        guard let newData = try? JSONSerialization.data(withJSONObject: root) else { return false }
-        let status = SecItemUpdate(baseQuery as CFDictionary, [kSecValueData as String: newData] as CFDictionary)
-        if status != errSecSuccess {
-            DebugLog.write("claude-cred: SecItemUpdate failed — \(keychainErrorText(status))")
-            return false
-        }
-        return true
     }
 }
 
