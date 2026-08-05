@@ -23,7 +23,11 @@ if CommandLine.arguments.contains("--once") {
     // only in the Keychain, the non-blocking GUI path always returns nil on first
     // call, so without this the one-shot readout could never reach the live API.
     ClaudeCredentials.prewarmBlocking()
-    let store = UsageStore(collectors: [ClaudeUsageCollector(), CodexUsageCollector()])
+    let store = UsageStore(collectors: [
+        ClaudeUsageCollector(),
+        CodexUsageCollector(),
+        CursorUsageCollector()
+    ])
     Task {
         let snapshots = await store.refresh()
         for provider in Provider.allCases {
@@ -34,10 +38,7 @@ if CommandLine.arguments.contains("--once") {
             } else if let error = s.error {
                 print("\(provider.rawValue)\(plan): \(error)")
             } else {
-                let d = UsageFormat.percentText(s.dailyPercent)
-                let w = UsageFormat.percentText(s.weeklyPercent)
-                print("\(provider.rawValue)\(plan): 5h \(d) (resets \(UsageFormat.resetText(s.dailyResetAt))), "
-                    + "week \(w) (resets \(UsageFormat.resetText(s.weeklyResetAt)))")
+                print("\(provider.rawValue)\(plan): \(UsageFormat.windowSummary(s))")
             }
         }
         exit(0)

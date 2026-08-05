@@ -2,10 +2,10 @@
 
 Tiny macOS menu bar gauges for your **Claude** and **ChatGPT / Codex** usage.
 
-Menubar Usage shows both the rolling **5-hour** and **weekly** limits directly in
-the menu bar, with a click-through popover for exact percentages, reset times,
-plan labels, and refresh status. It is menu-bar-only, has no Dock icon, and reads
-from the accounts you are already signed into locally.
+Menubar Usage shows the limit windows each provider currently reports directly
+in the menu bar, with a click-through popover for exact percentages, reset
+times, plan labels, and refresh status. It is menu-bar-only, has no Dock icon,
+and reads from the accounts you are already signed into locally.
 
 <p align="center">
   <img src="assets/both-preview.png" alt="Menubar Usage showing Claude and ChatGPT limits in the macOS menu bar" width="300">
@@ -13,8 +13,9 @@ from the accounts you are already signed into locally.
 
 ## Features
 
-- Compact menu bar display with one cell for Claude and one for ChatGPT.
-- Two gauges per provider: **5-hour** on top, **weekly** below.
+- Compact menu bar display with one cell per provider.
+- One gauge per reported limit window; providers with a single window show one
+  bar (for example, ChatGPT's current weekly limit).
 - Color-coded usage: green, yellow, orange, then red as limits get tight.
 - Popover with percentages, reset countdowns, clock times, plan labels, and
   last-updated text.
@@ -84,8 +85,10 @@ cannot be read, it estimates from local Claude project JSONL files.
 **ChatGPT / Codex**
 
 Uses `GET https://chatgpt.com/backend-api/wham/usage` with the token in
-`~/.codex/auth.json`. If live usage cannot be read, it estimates from local Codex
-session rollout JSONL files.
+`~/.codex/auth.json`. Window labels and reset times come from the endpoint, so a
+single weekly window is shown as one bar when no secondary window is returned.
+If live usage cannot be read, it estimates from local Codex session rollout JSONL
+files.
 
 ## Privacy
 

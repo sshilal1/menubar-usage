@@ -1,11 +1,13 @@
 import Foundation
 import Security
+import SQLite3
 
 // MARK: - Codex / ChatGPT collector
 //
 // Reads ChatGPT (Codex) usage. Codex is OpenAI's coding agent that runs against
-// your ChatGPT plan, so its primary (5-hour) and secondary (weekly) rate-limit
-// windows are exactly your ChatGPT subscription's limits.
+// your ChatGPT plan, so its primary and secondary rate-limit windows are
+// exactly your ChatGPT subscription's limits. The API may expose one window
+// (currently a weekly window for some plans) or two windows.
 //
 // Primary source is the live endpoint `chatgpt.com/backend-api/wham/usage`
 // (the same data the Codex TUI `/status` shows), authenticated with the token
@@ -15,7 +17,8 @@ struct CodexUsageCollector: UsageCollecting {
     let provider: Provider = .codex
 
     private struct Window: Decodable {
-        let used_percent: Double
+        let used_percent: Double?
+        let window_minutes: Double?
         let resets_at: Double?
     }
     private struct RateLimits: Decodable {
@@ -188,17 +191,17 @@ struct CodexUsageCollector: UsageCollecting {
             return nil
         }
 
-        guard rate.primary_window?.used_percent != nil || rate.secondary_window?.used_percent != nil else {
+        let primary = usageWindow(from: rate.primary_window)
+        let secondary = usageWindow(from: rate.secondary_window)
+        guard primary != nil || secondary != nil else {
             return nil
         }
 
         return UsageSnapshot(
             provider: .codex,
             isConnected: true,
-            dailyPercent: rate.primary_window?.used_percent,
-            weeklyPercent: rate.secondary_window?.used_percent,
-            dailyResetAt: rate.primary_window?.reset_at.map { Date(timeIntervalSince1970: $0) },
-            weeklyResetAt: rate.secondary_window?.reset_at.map { Date(timeIntervalSince1970: $0) },
+            primaryWindow: primary,
+            secondaryWindow: secondary,
             totalTokens: nil,
             planLabel: usage.plan_type.map { $0.capitalized },
             updatedAt: Date(),
@@ -253,15 +256,48 @@ struct CodexUsageCollector: UsageCollecting {
         return UsageSnapshot(
             provider: .codex,
             isConnected: true,
-            dailyPercent: limits.primary?.used_percent,
-            weeklyPercent: limits.secondary?.used_percent,
-            dailyResetAt: limits.primary?.resets_at.map { Date(timeIntervalSince1970: $0) },
-            weeklyResetAt: limits.secondary?.resets_at.map { Date(timeIntervalSince1970: $0) },
+            primaryWindow: Self.usageWindow(from: limits.primary, fallbackLabel: "Primary"),
+            secondaryWindow: Self.usageWindow(from: limits.secondary, fallbackLabel: "Secondary"),
             totalTokens: result.event.info?.total_token_usage?.total_tokens,
             planLabel: limits.plan_type.map { $0.capitalized },
             updatedAt: result.date == .distantPast ? Date() : result.date,
             error: nil
         )
+    }
+
+    private static func usageWindow(from window: APIWindow?) -> UsageWindow? {
+        guard let window,
+              window.used_percent != nil || window.reset_at != nil else { return nil }
+        return UsageWindow(
+            label: label(forSeconds: window.limit_window_seconds),
+            percent: window.used_percent,
+            resetAt: window.reset_at.map { Date(timeIntervalSince1970: $0) }
+        )
+    }
+
+    private static func usageWindow(from window: Window?, fallbackLabel: String) -> UsageWindow? {
+        guard let window,
+              window.used_percent != nil || window.resets_at != nil else { return nil }
+        return UsageWindow(
+            label: label(forMinutes: window.window_minutes, fallback: fallbackLabel),
+            percent: window.used_percent,
+            resetAt: window.resets_at.map { Date(timeIntervalSince1970: $0) }
+        )
+    }
+
+    private static func label(forSeconds seconds: Double?) -> String {
+        guard let seconds else { return "Primary" }
+        return label(forMinutes: seconds / 60, fallback: "Primary")
+    }
+
+    private static func label(forMinutes minutes: Double?, fallback: String) -> String {
+        guard let minutes else { return fallback }
+        if abs(minutes - 300) < 1 { return "5-hour" }
+        if minutes >= 7 * 24 * 60 - 1 { return "Weekly" }
+        if minutes >= 24 * 60 - 1 {
+            return "\(Int((minutes / (24 * 60)).rounded()))-day"
+        }
+        return "\(Int((minutes / 60).rounded()))-hour"
     }
 }
 
@@ -658,8 +694,8 @@ struct ClaudeUsageCollector: UsageCollecting {
         if let live = await liveSnapshot() {
             Self.storeLiveSnapshot(live)
             Self.clearFailureBackoff()
-            DebugLog.write("claude: LIVE ok — 5h=\(pct(live.dailyPercent))"
-                + " week=\(pct(live.weeklyPercent)) plan=\(live.planLabel ?? "—")")
+            DebugLog.write("claude: LIVE ok — 5h=\(pct(live.primaryWindow?.percent))"
+                + " week=\(pct(live.secondaryWindow?.percent)) plan=\(live.planLabel ?? "—")")
             return live
         }
 
@@ -778,10 +814,16 @@ struct ClaudeUsageCollector: UsageCollecting {
         let snapshot = UsageSnapshot(
             provider: .claude,
             isConnected: true,
-            dailyPercent: usage.five_hour?.utilization,
-            weeklyPercent: usage.seven_day?.utilization,
-            dailyResetAt: parseDate(usage.five_hour?.resets_at),
-            weeklyResetAt: parseDate(usage.seven_day?.resets_at),
+            primaryWindow: UsageWindow(
+                label: "5-hour",
+                percent: usage.five_hour?.utilization,
+                resetAt: parseDate(usage.five_hour?.resets_at)
+            ),
+            secondaryWindow: UsageWindow(
+                label: "Weekly",
+                percent: usage.seven_day?.utilization,
+                resetAt: parseDate(usage.seven_day?.resets_at)
+            ),
             totalTokens: nil,
             planLabel: plan,
             updatedAt: Date(),
@@ -875,14 +917,392 @@ struct ClaudeUsageCollector: UsageCollecting {
         return UsageSnapshot(
             provider: .claude,
             isConnected: true,
-            dailyPercent: dailyPercent,
-            weeklyPercent: weeklyPercent,
-            dailyResetAt: oldestFiveHour?.addingTimeInterval(5 * 3600),
-            weeklyResetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600),
+            primaryWindow: UsageWindow(
+                label: "5-hour",
+                percent: dailyPercent,
+                resetAt: oldestFiveHour?.addingTimeInterval(5 * 3600)
+            ),
+            secondaryWindow: UsageWindow(
+                label: "Weekly",
+                percent: weeklyPercent,
+                resetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600)
+            ),
             totalTokens: weeklyTokens,
             planLabel: AppConfig.shared.claudePlanLabel ?? "est.",
             updatedAt: latest == .distantPast ? now : latest,
             error: nil
         )
+    }
+}
+
+// MARK: - Cursor credentials + collector
+//
+// Same pattern as Claude/Codex: read a local login token, then hit Cursor's
+// usage endpoint. Token lives in Cursor's VS Code-state SQLite DB
+// (`cursorAuth/accessToken`). Live numbers come from Connect RPC
+// `DashboardService/GetCurrentPeriodUsage` — the same data Settings → Plan &
+// Usage shows (Cursor Models / Other Models percentages + billing-cycle end).
+
+enum CursorCredentials {
+    private static let dbPath = DataFiles.expand(
+        "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+    )
+    private static let clientID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
+    private static let tokenURL = URL(string: "https://api2.cursor.sh/oauth/token")!
+
+    /// App-owned copy of a refreshed access token. We never write back into
+    /// Cursor's `state.vscdb` (same prompt-fatigue reason as Claude's Keychain).
+    private static var appTokenPath: String {
+        DataFiles.expand("~/.config/menubar-usage/cursor-token.json")
+    }
+
+    private struct StoredToken: Codable {
+        let accessToken: String
+        let refreshToken: String?
+        let expiresAt: Date?
+    }
+
+    static func accessToken() -> String? {
+        if let stored = readAppToken(), !isExpired(stored) {
+            return stored.accessToken
+        }
+        return readDBValue(key: "cursorAuth/accessToken")
+    }
+
+    static func refreshToken() -> String? {
+        readAppToken()?.refreshToken
+            ?? readDBValue(key: "cursorAuth/refreshToken")
+    }
+
+    static func membershipType() -> String? {
+        readDBValue(key: "cursorAuth/stripeMembershipType")
+    }
+
+    /// Refresh the access token and stash it in our own file.
+    static func refreshIfPossible() async -> String? {
+        guard let refresh = refreshToken(), !refresh.isEmpty else {
+            DebugLog.write("cursor-cred: no refresh token available")
+            return nil
+        }
+
+        var request = URLRequest(url: tokenURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 8
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: String] = [
+            "grant_type": "refresh_token",
+            "client_id": clientID,
+            "refresh_token": refresh
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse else {
+            DebugLog.write("cursor-cred: token refresh request failed")
+            return nil
+        }
+        guard http.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let access = json["access_token"] as? String,
+              !access.isEmpty else {
+            DebugLog.write("cursor-cred: token refresh FAILED — HTTP \(http.statusCode)")
+            return nil
+        }
+        if json["shouldLogout"] as? Bool == true {
+            DebugLog.write("cursor-cred: refresh returned shouldLogout — re-login in Cursor")
+            return nil
+        }
+
+        let expiresAt = jwtExpiry(access)
+        let stored = StoredToken(
+            accessToken: access,
+            refreshToken: (json["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? refresh,
+            expiresAt: expiresAt
+        )
+        writeAppToken(stored)
+        DebugLog.write("cursor-cred: token REFRESHED ok"
+            + (expiresAt.map { " (expires \(ISO8601DateFormatter().string(from: $0)))" } ?? "")
+            + "; file write ok")
+        return access
+    }
+
+    private static func isExpired(_ stored: StoredToken) -> Bool {
+        guard let expiresAt = stored.expiresAt else {
+            return jwtExpiry(stored.accessToken).map { $0.timeIntervalSinceNow < 60 } ?? false
+        }
+        return expiresAt.timeIntervalSinceNow < 60
+    }
+
+    private static func jwtExpiry(_ token: String) -> Date? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let pad = (4 - payload.count % 4) % 4
+        if pad > 0 { payload += String(repeating: "=", count: pad) }
+        guard let data = Data(base64Encoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = json["exp"] as? TimeInterval else { return nil }
+        return Date(timeIntervalSince1970: exp)
+    }
+
+    private static func readAppToken() -> StoredToken? {
+        guard let data = FileManager.default.contents(atPath: appTokenPath),
+              let stored = try? JSONDecoder().decode(StoredToken.self, from: data),
+              !stored.accessToken.isEmpty else { return nil }
+        return stored
+    }
+
+    private static func writeAppToken(_ stored: StoredToken) {
+        let dir = DataFiles.expand("~/.config/menubar-usage")
+        try? FileManager.default.createDirectory(
+            atPath: dir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        let ok = FileManager.default.createFile(
+            atPath: appTokenPath,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        )
+        if !ok {
+            try? data.write(to: URL(fileURLWithPath: appTokenPath), options: .atomic)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: appTokenPath
+            )
+        }
+    }
+
+    /// Read a single `ItemTable` value from Cursor's state DB (read-only).
+    private static func readDBValue(key: String) -> String? {
+        var db: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
+        guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK, let db else {
+            DebugLog.write("cursor-cred: failed to open state.vscdb")
+            return nil
+        }
+        defer { sqlite3_close(db) }
+
+        let sql = "SELECT value FROM ItemTable WHERE key = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let bindOK = key.withCString { cKey in
+            sqlite3_bind_text(stmt, 1, cKey, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+        guard bindOK == SQLITE_OK,
+              sqlite3_step(stmt) == SQLITE_ROW,
+              let cString = sqlite3_column_text(stmt, 0) else {
+            return nil
+        }
+        let value = String(cString: cString)
+        return value.isEmpty ? nil : value
+    }
+}
+
+struct CursorUsageCollector: UsageCollecting {
+    let provider: Provider = .cursor
+
+    private static let usageURL = URL(
+        string: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+    )!
+
+    private static let liveCacheLock = NSLock()
+    private nonisolated(unsafe) static var liveCache: UsageSnapshot?
+    private nonisolated(unsafe) static var liveCacheAt: Date?
+    private nonisolated(unsafe) static var liveRetryAfter: Date?
+    private static let liveMinInterval: TimeInterval = 60
+    private static let liveFailureBackoff: TimeInterval = 90
+    private static let maxFailureBackoff: TimeInterval = 10 * 60
+
+    private struct PlanUsage: Decodable {
+        let autoPercentUsed: Double?
+        let apiPercentUsed: Double?
+        let totalPercentUsed: Double?
+        let includedSpend: Double?
+        let limit: Double?
+    }
+    private struct PeriodUsage: Decodable {
+        let billingCycleStart: String?
+        let billingCycleEnd: String?
+        let planUsage: PlanUsage?
+        let enabled: Bool?
+    }
+
+    func collect() async -> UsageSnapshot {
+        guard AuthDetector.current().isConnected(.cursor) else {
+            DebugLog.write("cursor: not signed in (no state.vscdb)")
+            return .disconnected(.cursor)
+        }
+
+        if let cached = Self.freshLiveSnapshot() {
+            DebugLog.write("cursor: serving fresh live cache (< \(Int(Self.liveMinInterval))s old)")
+            return cached
+        }
+
+        if let until = Self.inFailureBackoff() {
+            DebugLog.write("cursor: in live-fetch back-off"
+                + " (retrying in ~\(max(0, Int(until.timeIntervalSinceNow)))s)")
+            if let stale = Self.lastLiveSnapshot() { return stale }
+            return .failure(.cursor, message: "Updating…")
+        }
+
+        if let live = await liveSnapshot() {
+            Self.storeLiveSnapshot(live)
+            Self.clearFailureBackoff()
+            DebugLog.write("cursor: LIVE ok — models=\(pct(live.primaryWindow?.percent))"
+                + " other=\(pct(live.secondaryWindow?.percent)) plan=\(live.planLabel ?? "—")")
+            return live
+        }
+
+        if let stale = Self.lastLiveSnapshot() {
+            DebugLog.write("cursor: live fetch failed — serving STALE live cache")
+            return stale
+        }
+
+        DebugLog.write("cursor: live fetch failed and no cache")
+        return .failure(.cursor, message: "Couldn't reach Cursor usage API")
+    }
+
+    private func pct(_ value: Double?) -> String {
+        value.map { String(format: "%.0f%%", $0) } ?? "—"
+    }
+
+    private func liveSnapshot() async -> UsageSnapshot? {
+        guard var token = CursorCredentials.accessToken() else {
+            DebugLog.write("cursor: no access token in state.vscdb")
+            return nil
+        }
+
+        var result = await fetchUsage(token: token)
+        if result.status == 401 {
+            DebugLog.write("cursor: live API 401 — refreshing token and retrying")
+            if let refreshed = await CursorCredentials.refreshIfPossible() {
+                token = refreshed
+                result = await fetchUsage(token: token)
+            }
+        }
+
+        guard result.status == 200 else {
+            DebugLog.write("cursor: live API returned HTTP \(result.status)")
+            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
+            return nil
+        }
+        guard let snapshot = result.snapshot else {
+            DebugLog.write("cursor: live API 200 but decode failed")
+            Self.setFailureBackoff(seconds: Self.liveFailureBackoff)
+            return nil
+        }
+        return snapshot
+    }
+
+    private struct FetchResult {
+        let snapshot: UsageSnapshot?
+        let status: Int
+    }
+
+    private func fetchUsage(token: String) async -> FetchResult {
+        var request = URLRequest(url: Self.usageURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 8
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        request.httpBody = Data("{}".utf8)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            DebugLog.write("cursor: live request errored — \(error.localizedDescription)")
+            return FetchResult(snapshot: nil, status: -1)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            return FetchResult(snapshot: nil, status: -2)
+        }
+        guard http.statusCode == 200 else {
+            return FetchResult(snapshot: nil, status: http.statusCode)
+        }
+        guard let usage = try? JSONDecoder().decode(PeriodUsage.self, from: data),
+              let plan = usage.planUsage else {
+            return FetchResult(snapshot: nil, status: 200)
+        }
+
+        let resetAt = Self.parseMillis(usage.billingCycleEnd)
+        let planLabel = CursorCredentials.membershipType().map { $0.capitalized } ?? "Pro"
+
+        // Settings → Plan & Usage: "Cursor Models" (auto) and "Other Models" (api).
+        let snapshot = UsageSnapshot(
+            provider: .cursor,
+            isConnected: true,
+            primaryWindow: UsageWindow(
+                label: "Models",
+                percent: plan.autoPercentUsed,
+                resetAt: resetAt
+            ),
+            secondaryWindow: UsageWindow(
+                label: "Other",
+                percent: plan.apiPercentUsed,
+                resetAt: resetAt
+            ),
+            totalTokens: nil,
+            planLabel: planLabel,
+            updatedAt: Date(),
+            error: nil
+        )
+        return FetchResult(snapshot: snapshot, status: 200)
+    }
+
+    private static func parseMillis(_ value: String?) -> Date? {
+        guard let value, let ms = Double(value) else { return nil }
+        return Date(timeIntervalSince1970: ms / 1000)
+    }
+
+    private static func freshLiveSnapshot() -> UsageSnapshot? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        guard let snapshot = liveCache, let at = liveCacheAt,
+              Date().timeIntervalSince(at) < liveMinInterval else { return nil }
+        return snapshot
+    }
+
+    private static func lastLiveSnapshot() -> UsageSnapshot? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        return liveCache
+    }
+
+    private static func storeLiveSnapshot(_ snapshot: UsageSnapshot) {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveCache = snapshot
+        liveCacheAt = Date()
+    }
+
+    private static func inFailureBackoff() -> Date? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        guard let until = liveRetryAfter, until > Date() else { return nil }
+        return until
+    }
+
+    private static func setFailureBackoff(seconds: TimeInterval) {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveRetryAfter = Date().addingTimeInterval(min(max(seconds, liveFailureBackoff), maxFailureBackoff))
+    }
+
+    private static func clearFailureBackoff() {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveRetryAfter = nil
     }
 }

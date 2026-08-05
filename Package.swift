@@ -13,7 +13,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "MenubarUsage",
-            path: "Sources/MenubarUsage"
+            path: "Sources/MenubarUsage",
+            linkerSettings: [
+                .linkedLibrary("sqlite3")
+            ]
         )
     ]
 )

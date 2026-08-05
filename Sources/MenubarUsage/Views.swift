@@ -135,6 +135,9 @@ enum ProviderBranding {
         case .codex:
             bundleID = "com.openai.chat"
             fallbackPath = "/Applications/ChatGPT.app"
+        case .cursor:
+            bundleID = "com.todesktop.230313mzl4w4u92"
+            fallbackPath = "/Applications/Cursor.app"
         }
         let workspace = NSWorkspace.shared
         let url = workspace.urlForApplication(withBundleIdentifier: bundleID)
@@ -207,7 +210,7 @@ final class PopoverLimitBar: NSView {
             withAttributes: valueAttrs
         )
 
-        let barX: CGFloat = 62
+        let barX: CGFloat = max(62, captionSize.width + 8)
         let barMaxX = bounds.maxX - valueSize.width - 12
         let barWidth = barMaxX - barX
         guard barWidth > 4 else { return }
@@ -252,9 +255,10 @@ final class StatusDotView: NSView {
 // MARK: - Menu bar gauge
 
 /// Renders the always-visible menu bar content: for each provider a single-letter
-/// badge plus two slim horizontal gauge bars (5-hour and weekly), color-graded by
-/// consumption. Produces an `NSImage` sized to the menu bar so it can be set as
-/// the status item's button image (clicks + positioning come for free).
+/// badge plus one slim horizontal gauge bar per reported limit window,
+/// color-graded by consumption. Produces an `NSImage` sized to the menu bar so
+/// it can be set as the status item's button image (clicks + positioning come
+/// for free).
 enum MenuBarGauge {
     private static var badgeFont: NSFont { NSFont.systemFont(ofSize: 9, weight: .bold) }
     private static let barWidth: CGFloat = 20
@@ -264,7 +268,7 @@ enum MenuBarGauge {
     private static let providerGap: CGFloat = 9
     private static let sidePadding: CGFloat = 3
 
-    /// Width one provider's cell occupies (badge + two bars).
+    /// Width one provider's cell occupies (badge + up to two bars).
     private static func cellWidth(badge: String) -> CGFloat {
         let badgeWidth = (badge as NSString).size(withAttributes: [.font: badgeFont]).width
         return badgeWidth + badgeGap + barWidth
@@ -315,14 +319,17 @@ enum MenuBarGauge {
         badge.draw(at: NSPoint(x: x, y: (height - badgeSize.height) / 2), withAttributes: badgeAttrs)
         x += badgeSize.width + badgeGap
 
-        // Two stacked gauges: 5-hour on top, weekly below. Low values are much
-        // easier to distinguish this way than in a 3-point vertical capsule.
-        let stackHeight = barHeight * 2 + barGap
+        let windows = [snapshot.primaryWindow, snapshot.secondaryWindow].compactMap { $0 }
+        // Keep a single placeholder track for disconnected/empty data, while
+        // allowing providers with one current limit window to show one bar.
+        let barCount = max(1, windows.count)
+        let stackHeight = barHeight * CGFloat(barCount) + barGap * CGFloat(barCount - 1)
         let bottom = (height - stackHeight) / 2
-        drawBar(percent: snapshot.dailyPercent, connected: snapshot.isConnected,
-                x: x, y: bottom + barHeight + barGap)
-        drawBar(percent: snapshot.weeklyPercent, connected: snapshot.isConnected,
-                x: x, y: bottom)
+        for index in 0..<barCount {
+            let percent = index < windows.count ? windows[index].percent : nil
+            let y = bottom + CGFloat(barCount - 1 - index) * (barHeight + barGap)
+            drawBar(percent: percent, connected: snapshot.isConnected, x: x, y: y)
+        }
         x += barWidth
 
         return x

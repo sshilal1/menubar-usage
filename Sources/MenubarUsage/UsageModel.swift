@@ -9,17 +9,24 @@ import Security
 // trimmed to the two providers we care about — Claude and ChatGPT/Codex — and
 // reused unchanged in behavior. The UI on top of it (menu bar + popover) is new.
 
+/// A single provider limit window.
+struct UsageWindow: Sendable {
+    let label: String
+    let percent: Double?
+    let resetAt: Date?
+}
+
 /// A structured, real-data snapshot of a provider's usage.
 ///
-/// `dailyPercent` / `weeklyPercent` are the share of the rolling primary
-/// (5-hour) and secondary (weekly) limit windows that have been consumed.
+/// Providers may expose one or more windows, and the meaning of each window
+/// can change over time. Keep the labels with the data instead of assuming
+/// that the primary window is always 5 hours or that a secondary window is
+/// always weekly.
 struct UsageSnapshot: Sendable {
     let provider: Provider
     let isConnected: Bool
-    let dailyPercent: Double?
-    let weeklyPercent: Double?
-    let dailyResetAt: Date?
-    let weeklyResetAt: Date?
+    let primaryWindow: UsageWindow?
+    let secondaryWindow: UsageWindow?
     let totalTokens: Int?
     let planLabel: String?
     let updatedAt: Date
@@ -27,22 +34,17 @@ struct UsageSnapshot: Sendable {
 
     /// The most-constrained window — used to color the menu bar gauge.
     var headlinePercent: Double? {
-        switch (dailyPercent, weeklyPercent) {
-        case let (d?, w?): return max(d, w)
-        case let (d?, nil): return d
-        case let (nil, w?): return w
-        default: return nil
-        }
+        [primaryWindow?.percent, secondaryWindow?.percent]
+            .compactMap { $0 }
+            .max()
     }
 
     static func disconnected(_ provider: Provider) -> UsageSnapshot {
         UsageSnapshot(
             provider: provider,
             isConnected: false,
-            dailyPercent: nil,
-            weeklyPercent: nil,
-            dailyResetAt: nil,
-            weeklyResetAt: nil,
+            primaryWindow: nil,
+            secondaryWindow: nil,
             totalTokens: nil,
             planLabel: nil,
             updatedAt: Date(),
@@ -54,10 +56,8 @@ struct UsageSnapshot: Sendable {
         UsageSnapshot(
             provider: provider,
             isConnected: true,
-            dailyPercent: nil,
-            weeklyPercent: nil,
-            dailyResetAt: nil,
-            weeklyResetAt: nil,
+            primaryWindow: nil,
+            secondaryWindow: nil,
             totalTokens: nil,
             planLabel: nil,
             updatedAt: Date(),
@@ -69,14 +69,16 @@ struct UsageSnapshot: Sendable {
 enum Provider: String, CaseIterable, Sendable {
     case claude = "Claude"
     case codex = "ChatGPT"
+    case cursor = "Cursor"
 
     var symbol: String { rawValue }
 
-    /// Single-letter badge used in the compact menu bar gauge.
+    /// Compact badge used in the menu bar gauge.
     var menuBarBadge: String {
         switch self {
         case .claude: "C"
         case .codex: "G"
+        case .cursor: "Cu"
         }
     }
 
@@ -85,6 +87,7 @@ enum Provider: String, CaseIterable, Sendable {
         switch self {
         case .claude: "C"
         case .codex: "G"
+        case .cursor: "Cu"
         }
     }
 
@@ -92,6 +95,7 @@ enum Provider: String, CaseIterable, Sendable {
         switch self {
         case .claude: URL(string: "https://claude.ai/login")!
         case .codex: URL(string: "https://chatgpt.com/codex")!
+        case .cursor: URL(string: "https://cursor.com/dashboard")!
         }
     }
 
@@ -99,6 +103,7 @@ enum Provider: String, CaseIterable, Sendable {
         switch self {
         case .claude: NSColor(calibratedRed: 0.85, green: 0.49, blue: 0.30, alpha: 1)
         case .codex: NSColor(calibratedRed: 0.10, green: 0.65, blue: 0.53, alpha: 1)
+        case .cursor: NSColor(calibratedRed: 0.35, green: 0.55, blue: 0.95, alpha: 1)
         }
     }
 }
@@ -139,6 +144,15 @@ enum UsageFormat {
         if hours > 0 { return "\(hours)h \(minutes)m" }
         return "\(minutes)m"
     }
+
+    static func windowSummary(_ snapshot: UsageSnapshot) -> String {
+        [snapshot.primaryWindow, snapshot.secondaryWindow]
+            .compactMap { $0 }
+            .map { window in
+                "\(window.label) \(percentText(window.percent)) (resets \(resetText(window.resetAt)))"
+            }
+            .joined(separator: ", ")
+    }
 }
 
 struct AuthState {
@@ -169,6 +183,10 @@ enum AuthDetector {
                 "~/.claude/.credentials.json",
                 "~/.claude/config.json",
                 "~/.config/claude/credentials.json"
+            ]
+        case .cursor:
+            [
+                "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
             ]
         }
     }

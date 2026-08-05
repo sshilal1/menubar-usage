@@ -56,10 +56,16 @@ private func makePopoverScreenshot() -> NSImage {
         UsageSnapshot(
             provider: .claude,
             isConnected: true,
-            dailyPercent: 54,
-            weeklyPercent: 16,
-            dailyResetAt: now.addingTimeInterval(60 * 60 + 53 * 60),
-            weeklyResetAt: now.addingTimeInterval(4 * 24 * 60 * 60 + 19 * 60 * 60),
+            primaryWindow: UsageWindow(
+                label: "5-hour",
+                percent: 54,
+                resetAt: now.addingTimeInterval(60 * 60 + 53 * 60)
+            ),
+            secondaryWindow: UsageWindow(
+                label: "Weekly",
+                percent: 16,
+                resetAt: now.addingTimeInterval(4 * 24 * 60 * 60 + 19 * 60 * 60)
+            ),
             totalTokens: 49_200_000,
             planLabel: "Pro",
             updatedAt: now.addingTimeInterval(-120),
@@ -68,10 +74,12 @@ private func makePopoverScreenshot() -> NSImage {
         UsageSnapshot(
             provider: .codex,
             isConnected: true,
-            dailyPercent: 1,
-            weeklyPercent: 10,
-            dailyResetAt: now.addingTimeInterval(4 * 60 * 60 + 59 * 60),
-            weeklyResetAt: now.addingTimeInterval(5 * 24 * 60 * 60 + 15 * 60 * 60),
+            primaryWindow: UsageWindow(
+                label: "Weekly",
+                percent: 10,
+                resetAt: now.addingTimeInterval(5 * 24 * 60 * 60 + 15 * 60 * 60)
+            ),
+            secondaryWindow: nil,
             totalTokens: 1_800_000,
             planLabel: "Plus",
             updatedAt: now.addingTimeInterval(-6),
@@ -116,10 +124,8 @@ private func makeMenuBarScreenshot() -> NSImage {
         UsageSnapshot(
             provider: .claude,
             isConnected: true,
-            dailyPercent: 54,
-            weeklyPercent: 16,
-            dailyResetAt: nil,
-            weeklyResetAt: nil,
+            primaryWindow: UsageWindow(label: "5-hour", percent: 54, resetAt: nil),
+            secondaryWindow: UsageWindow(label: "Weekly", percent: 16, resetAt: nil),
             totalTokens: nil,
             planLabel: nil,
             updatedAt: Date(),
@@ -128,10 +134,8 @@ private func makeMenuBarScreenshot() -> NSImage {
         UsageSnapshot(
             provider: .codex,
             isConnected: true,
-            dailyPercent: 1,
-            weeklyPercent: 10,
-            dailyResetAt: nil,
-            weeklyResetAt: nil,
+            primaryWindow: UsageWindow(label: "Weekly", percent: 10, resetAt: nil),
+            secondaryWindow: nil,
             totalTokens: nil,
             planLabel: nil,
             updatedAt: Date(),

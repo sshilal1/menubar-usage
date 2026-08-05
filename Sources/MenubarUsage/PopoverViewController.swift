@@ -1,8 +1,8 @@
 import AppKit
 
 /// The expanded view shown when the menu bar gauge is clicked: one card per
-/// provider with 5-hour and weekly bars, reset countdowns, plan label, and a
-/// footer with Refresh / Quit.
+/// provider with the limit windows reported by that provider, reset countdowns,
+/// plan label, and a footer with Refresh / Quit.
 @MainActor
 final class PopoverViewController: NSViewController {
     private static let cardWidth: CGFloat = 280
@@ -100,7 +100,7 @@ final class PopoverViewController: NSViewController {
         title.font = .systemFont(ofSize: 16, weight: .bold)
         container.addArrangedSubview(title)
 
-        let subtitle = NSTextField(labelWithString: "Claude & ChatGPT limits")
+        let subtitle = NSTextField(labelWithString: "Claude, ChatGPT & Cursor limits")
         subtitle.font = .systemFont(ofSize: 11)
         subtitle.textColor = .secondaryLabelColor
         container.addArrangedSubview(subtitle)
@@ -181,18 +181,48 @@ final class PopoverViewController: NSViewController {
             errorLabel.preferredMaxLayoutWidth = innerWidth
             content.addArrangedSubview(errorLabel)
         } else {
-            content.addArrangedSubview(limitBar(caption: "5-hour", percent: snapshot.dailyPercent, width: innerWidth))
-            content.addArrangedSubview(resetRow(label: "5h resets", date: snapshot.dailyResetAt, width: innerWidth))
-            content.setCustomSpacing(10, after: content.arrangedSubviews.last!)
-            content.addArrangedSubview(limitBar(caption: "Weekly", percent: snapshot.weeklyPercent, width: innerWidth))
-            content.addArrangedSubview(resetRow(label: "Week resets", date: snapshot.weeklyResetAt, width: innerWidth))
+            let windows = [snapshot.primaryWindow, snapshot.secondaryWindow].compactMap { $0 }
+            let sharedReset = windows.count >= 2
+                && windows[0].resetAt != nil
+                && windows[0].resetAt == windows[1].resetAt
+
+            var lastWindowView: NSView?
+            for (index, window) in windows.enumerated() {
+                content.addArrangedSubview(limitBar(
+                    caption: window.label,
+                    percent: window.percent,
+                    width: innerWidth
+                ))
+                if sharedReset {
+                    if index == windows.count - 1 {
+                        let reset = resetRow(label: "Resets", date: window.resetAt, width: innerWidth)
+                        content.addArrangedSubview(reset)
+                        lastWindowView = reset
+                    }
+                } else {
+                    let resetLabel: String
+                    switch window.label {
+                    case "5-hour": resetLabel = "5h resets"
+                    case "Weekly": resetLabel = "Week resets"
+                    default: resetLabel = "\(window.label) resets"
+                    }
+                    let reset = resetRow(label: resetLabel, date: window.resetAt, width: innerWidth)
+                    content.addArrangedSubview(reset)
+                    lastWindowView = reset
+                    if index < windows.count - 1 {
+                        content.setCustomSpacing(10, after: reset)
+                    }
+                }
+            }
 
             let meta = NSTextField(labelWithString: metaText(for: snapshot))
             meta.font = .systemFont(ofSize: 10)
             meta.textColor = .tertiaryLabelColor
             meta.lineBreakMode = .byTruncatingTail
             content.addArrangedSubview(meta)
-            content.setCustomSpacing(10, after: content.arrangedSubviews[content.arrangedSubviews.count - 2])
+            if let lastWindowView {
+                content.setCustomSpacing(10, after: lastWindowView)
+            }
         }
 
         return box

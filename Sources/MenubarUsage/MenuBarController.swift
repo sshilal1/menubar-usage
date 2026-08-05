@@ -19,7 +19,8 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
     override init() {
         self.store = UsageStore(collectors: [
             ClaudeUsageCollector(),
-            CodexUsageCollector()
+            CodexUsageCollector(),
+            CursorUsageCollector()
         ])
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.popoverController = PopoverViewController()
@@ -86,13 +87,11 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
     }
 
     private func tooltip() -> String {
-        guard !latest.isEmpty else { return "Claude & ChatGPT usage" }
+        guard !latest.isEmpty else { return "Claude, ChatGPT & Cursor usage" }
         let parts = Provider.allCases.compactMap { provider -> String? in
             guard let snap = latest.first(where: { $0.provider == provider }) else { return nil }
             guard snap.isConnected else { return "\(provider.rawValue): not signed in" }
-            let d = UsageFormat.percentText(snap.dailyPercent)
-            let w = UsageFormat.percentText(snap.weeklyPercent)
-            return "\(provider.rawValue): 5h \(d), week \(w)"
+            return "\(provider.rawValue): \(UsageFormat.windowSummary(snap))"
         }
         return parts.joined(separator: "\n")
     }
